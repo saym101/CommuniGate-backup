@@ -29,7 +29,7 @@
 
 1. **Скачайте скрипт**:
    ```bash
-   wget https://raw.githubusercontent.com/<your-username>/<your-repo>/main/communigate_backup.sh
+   wget https://github.com/saym101/CommuniGate-backup/raw/refs/heads/main/communigate_backup.sh
    ```
 
 2. **Установите права на выполнение**:
