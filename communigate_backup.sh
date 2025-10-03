@@ -12,7 +12,10 @@
 # Requirements: bash, tar, curl, base64, pigz (optional for faster compression).
 # License: MIT (use, modify, and distribute freely with attribution).
 # -------------------------------------------------------------------
-
+# Автор: saym101
+# Версия: 3.4
+# Лицензия: MIT
+# Репозиторий: https://github.com/saym101/CommuniGate-backup
 set -euo pipefail
 
 # Скрипт зависит от этих программ. Их необходимо установить при первом запуске скрипта. потом можно закомментировать.
