@@ -1,6 +1,6 @@
 # Скрипт резервного копирования CommuniGate Pro
 
-![Version](https://img.shields.io/badge/version-2.9-blue)
+![Version](https://img.shields.io/badge/version-3.4-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Debian%2FUbuntu-orange)
 
