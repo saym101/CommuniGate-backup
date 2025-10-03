@@ -1,5 +1,9 @@
 # Скрипт резервного копирования CommuniGate Pro
 
+![Version](https://img.shields.io/badge/version-2.9-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-Debian%2FUbuntu-orange)
+
 Этот Bash-скрипт предназначен для автоматизации резервного копирования данных сервера CommuniGate Pro. Скрипт создает ежедневные и месячные резервные копии, загружает их на FTP-сервер, управляет сроками хранения и отправляет уведомления по email с подробными логами.
 
 ## Возможности
