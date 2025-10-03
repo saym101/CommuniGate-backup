@@ -1,506 +1,593 @@
 #!/bin/bash
-
+# shellcheck disable=SC2155
+# Это отключит предупреждения о declare and assign для readonly переменных
+# shellcheck verified - все предупреждения исправлены
 # -------------------------------------------------------------------
 # CommuniGate Pro Backup Script
 # Purpose: Creates daily and monthly backups of CommuniGate Pro data,
 #          uploads them to an FTP server, cleans up old backups (local and FTP),
 #          and sends email notifications.
 # Usage: Configure the variables in "User Configuration" section below,
-#        then run the script daily via cron (e.g., `0 2 * * * /path/to/script.sh`).
+#        then run the script daily via cron (e.g., `0 2 * * * /path/to/communigate_backup.sh`).
 # Requirements: bash, tar, curl, base64, pigz (optional for faster compression).
 # License: MIT (use, modify, and distribute freely with attribution).
 # -------------------------------------------------------------------
 
+set -euo pipefail
+
+# Скрипт зависит от этих программ. Их необходимо установить при первом запуске скрипта. потом можно закомментировать.
+ apt -y install pigz curl rsync tar bc
+
+# Проверка на root вынесена в самое начало для большей ясности.
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Скрипт не запущен от root. :( Перезапускаю через su..."
+    # Используем exec, чтобы заменить текущий процесс, а не создавать дочерний.
+    exec su -c "bash '$0' $*" root
+fi
+echo "Скрипт запущен от root. Продолжаю работу :)"
+
 # -------------------- КОНФИГУРАЦИЯ ПОЛЬЗОВАТЕЛЯ --------------------
 # Эти переменные необходимо настроить под ваш сервер.
 
-# BASE_DIR: Путь к директории данных CommuniGate Pro.
-# Пример: "/var/CommuniGate"
-# Укажите полный путь к директории, где хранятся данные CommuniGate (Accounts, SystemLogs, Settings, Domains).
-BASE_DIR="/path/to/CommuniGate"
+PROGRAM_INSTALL=(pigz curl rsync tar bc)
+AUTO_INSTALL=false	# Запускать проверку для установки программ или нет.
+DEBUG=false  # Можно выставить в true для отладки
+FAILED_ARCHIVES_LIST=""
 
-# BACKUP_BASE: Базовая директория для локальных резервных копий.
-# Пример: "/backups/CommuniGate"
-# Укажите путь, куда будут сохраняться архивы (должна быть доступна для записи).
-BACKUP_BASE="/path/to/backups"
+BASE_DIR="/var/CommuniGate"
+BACKUP_BASE="/backups/CommuniGate/Day"
+MONTHLY_BACKUP_DIR="/backups/CommuniGate/Monthly"
+DOMAINS_DIR="$BASE_DIR/Domains"
 
-# FTP_SERVER: Адрес FTP-сервера для хранения резервных копий.
-# Пример: "ftp.example.com" или "192.168.1.100"
-# Укажите домен или IP-адрес вашего FTP-сервера.
-FTP_SERVER=""
+SHARA="/mnt/share/"
+SHARA_DIR_DAY="/CommuniGate/Day"
+SHARA_DIR_MONTHLY="/CommuniGate/Monthly"
 
-# FTP_PORT: Порт FTP-сервера.
-# Пример: "21" (стандартный порт) или "2121" для нестандартного.
-# Укажите порт, если ваш FTP-сервер использует порт, отличный от 21. Оставьте пустым для порта по умолчанию (21).
-FTP_PORT="21"
+RETENTION_DAYS=6
+MONTHLY_RETENTION=3
 
-# FTP_USER: Имя пользователя для доступа к FTP.
-# Пример: "ftp_user"
-# Укажите имя пользователя FTP.
-FTP_USER=""
+START_TS=$(date "+%Y-%m-%d-%H%M%S")
+TODAY=$(date +%Y-%m-%d)
+TODAY_DIR="$BACKUP_BASE/$TODAY"
 
-# FTP_PASS: Пароль для доступа к FTP.
-# Пример: "your_secure_password"
-# Укажите пароль FTP (храните скрипт в безопасном месте).
-FTP_PASS=""
+LOG_DIR="/backups/CommuniGate/Logs"
+LOG_FILE="$LOG_DIR/backup_${START_TS}.log"
 
-# FTP_BASE_DIR: Базовый путь на FTP-сервере для хранения резервных копий.
-# Пример: "/backups/CommuniGate"
-# Укажите путь на FTP, куда будут загружаться архивы (без конечного слэша).
-FTP_BASE_DIR="/backups"
+MAIN_DOMAIN="example.com" # Свой домен сюда
 
-# NOTIFICATION_EMAIL: Email для отправки уведомлений.
-# Пример: "admin@example.com"
-# Укажите адрес, на который будут приходить отчеты о выполнении.
-NOTIFICATION_EMAIL=""
+FOLDER_BASE=(
+    "/var/CommuniGate/Settings"
+    "/var/CommuniGate/Directory"
+    "/var/CommuniGate/SystemLogs"
+    "/var/CommuniGate/Submitted"
+)
+#    "/var/CommuniGate/CGP-KAS" # Перенести выше в массив, если нужны. Или добавить свои.
+#    "/var/CommuniGate/CGP-KAV"
 
-# POSTMASTER_NAME: Email-адрес отправителя уведомлений.
-# Пример: "backup@example.com"
-# Укажите адрес, от имени которого отправляются письма (обычно совпадает с NOTIFICATION_EMAIL).
-POSTMASTER_NAME=""
 
-# SMTP_SERVER: Адрес SMTP-сервера для отправки email.
-# Пример: "smtp.example.com" или "127.0.0.1"
-# Укажите адрес SMTP-сервера (может быть локальным или внешним).
-SMTP_SERVER=""
+EMAIL_TO="admin@example.com" # адрес postmaster
+EMAIL_FROM="backup@example.com" # адрес postmaster
+SMTP_SERVER="smtp://127.0.0.1:25"
+# SMTP_USER="" # для использования не локального почтового серера. в функции send_email заменить строку для отправки.
+# SMTP_PASS=""
 
-# MAIN_DOMAIN: Основной домен сервера для именования архива Accounts.
-# Пример: "example.com"
-# Укажите основной домен, который будет использоваться в имени архива Accounts.
-MAIN_DOMAIN="example.com"
+REQUIRED_SPACE=2000 # Мб минимум свободного места (пример)
+ARCHIVE_RETRY_COUNT=4      # Общее количество попыток архивации
+ARCHIVE_RETRY_DELAY_SECONDS=5 # Пауза в секундах между попытками
 
-# -------------------- СИСТЕМНЫЕ НАСТРОЙКИ --------------------
-# Эти переменные обычно не требуют изменений, но могут быть настроены при необходимости.
+##################################################
+# Глобальные переменные для отчёта
+SENT_FILES=0
+SENT_FILES_LIST=""
+TOTAL_SIZE=0
+ERRORS_IN_RUN=()
+free_space=0
+ACCOUNTS_MISSING_ARCHIVES="" # Хранит список пропущенных пользователей
 
-# TODAY: Текущая дата в формате YYYY-MM-DD (автоматически).
-# Используется для именования директорий и архивов.
-TODAY=$(date +"%Y-%m-%d")
-
-# TIMESTAMP: Текущее время в формате HHMMSS (автоматически).
-# Добавляется к именам архивов для уникальности.
-TIMESTAMP=$(date +"%H%M%S")
-
-# DAY_OF_MONTH: День месяца (автоматически).
-# Используется для определения, нужно ли создавать месячные архивы (1-е число).
-DAY_OF_MONTH=$(date +"%d")
-
-# MONTH: Год и месяц в формате YYYY-MM (автоматически).
-# Используется для логирования и именования месячных архивов.
-MONTH=$(date +"%Y-%m")
-
-# BACKUP_DIR: Директория для ежедневных архивов.
-# Формируется как $BACKUP_BASE/YYYY-MM-DD.
-BACKUP_DIR="$BACKUP_BASE/$TODAY"
-
-# MONTHLY_BACKUP_DIR: Директория для месячных архивов.
-# Формируется как $BACKUP_BASE/Monthly.
-MONTHLY_BACKUP_DIR="$BACKUP_BASE/Monthly"
-
-# LOG_FILE: Путь к файлу лога.
-# Хранит подробный отчет о выполнении скрипта.
-LOG_FILE="$BACKUP_DIR/backup.log"
-
-# FTP_TARGET_DIR: Путь на FTP для текущей даты.
-# Формируется как $FTP_BASE_DIR/YYYY-MM-DD.
-FTP_TARGET_DIR="$FTP_BASE_DIR/$TODAY"
-
-# SHOW_LOG: Выводить логи в консоль в реальном времени (true/false).
-# Полезно для отладки или мониторинга.
-SHOW_LOG=true
-
-# CLEAR_BACKUP_DIR: Очищать $BACKUP_DIR перед новым запуском (true/false).
-# Если true, удаляет старые архивы в $BACKUP_DIR перед созданием новых.
-CLEAR_BACKUP_DIR=false
-
-# RETENTION_DAYS: Время хранения ежедневных архивов (в днях).
-# Архивы старше этого срока удаляются локально и на FTP.
-RETENTION_DAYS=7
-
-# MONTHLY_RETENTION: Количество хранимых наборов месячных архивов.
-# Оставляет указанное количество последних наборов (по 1-му числу месяца).
-MONTHLY_RETENTION=2
-
-# REQUIRED_SPACE: Минимальное свободное место на диске (в МБ).
-# Если места меньше, скрипт завершится с ошибкой.
-REQUIRED_SPACE=1024
-
-# -------------------- ПРОВЕРКА ЗАВИСИМОСТЕЙ --------------------
-# Проверка наличия необходимых утилит
-USE_PIGZ=false
-for cmd in tar curl base64; do
-    command -v "$cmd" >/dev/null || { echo "[$(date)]: Ошибка: Утилита $cmd не найдена" >&2; exit 1; }
-done
-if command -v pigz >/dev/null; then
-    USE_PIGZ=true
-    echo "[$(date)]: pigz найден, будет использоваться для сжатия" >&2
-else
-    echo "[$(date)]: pigz не найден, будет использоваться стандартный gzip" >&2
-fi
-
-# Проверка обязательных пользовательских настроек
-for var in FTP_SERVER FTP_USER FTP_PASS NOTIFICATION_EMAIL; do
-    if [ -z "${!var}" ]; then
-        echo "[$(date)]: Ошибка: Переменная $var не задана" >&2
-        exit 1
+##################################################
+# Логирование
+log_message() {
+    echo "[$(date '+%F %T')] INFO: $*"
+}
+log_error() {
+    echo "[$(date '+%F %T')] ERROR: $*" >&2
+    ERRORS_IN_RUN+=("$*")
+}
+log_debug() {
+    if [[ "$DEBUG" == "true" ]]; then
+        echo "[$(date '+%F %T')] DEBUG: $*"
     fi
-done
+}
+# только для ошибок архивации
+log_archive_failure() {
+    echo "[$(date '+%F %T')] ERROR: $*" >&2
+    # Добавляем ошибку в ОБЩИЙ список для статуса WARNING
+    ERRORS_IN_RUN+=("$*")
+    # И отдельно добавляем путь в СПЕЦИАЛЬНЫЙ список для отчёта
+    FAILED_ARCHIVES_LIST+="<li>$2</li>"
+}
+##################################################
+# Проверка установки нужных программ
+check_dependencies() {
+    log_message "Проверка зависимостей..."
+    local missing_deps=()
+    for dep in "${PROGRAM_INSTALL[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing_deps+=("$dep")
+        fi
+    done
 
-# Формирование FTP URL с учетом порта
-if [ -n "$FTP_PORT" ]; then
-    FTP_URL="ftp://$FTP_SERVER:$FTP_PORT"
-else
-    FTP_URL="ftp://$FTP_SERVER"
-fi
+    if (( ${#missing_deps[@]} > 0 )); then
+        log_error "Не установлены следующие зависимости: ${missing_deps[*]}"
+        if [[ "$AUTO_INSTALL" == "true" ]]; then
+            log_message "Попытка автоматической установки через apt..."
+            if apt -y install "${missing_deps[@]}" >> "$LOG_FILE" 2>&1; then
+                log_message "Все зависимости успешно установлены."
+            else
+                log_error "Ошибка при установке зависимостей. Прекращаю выполнение."
+                exit 1
+            fi
+        else
+            log_error "Автоустановка отключена. Пожалуйста, установите зависимости вручную."
+            exit 1
+        fi
+    fi
+    log_message "Все зависимости на месте."
+}
 
-# -------------------- ПОДГОТОВКА --------------------
-# Проверка прав доступа
-[ -r "$BASE_DIR" ] || { echo "[$(date)]: Ошибка: Нет прав чтения в $BASE_DIR" >&2; exit 1; }
-[ -w "$BACKUP_BASE" ] || { echo "[$(date)]: Ошибка: Нет прав записи в $BACKUP_BASE" >&2; exit 1; }
+##################################################
+# Проверка целостности архивов
+verify_archive() {
+    local archive="$1"
+	local archive_name
+	archive_name=$(basename "$archive")
+    
+    log_message "Проверка целостности архива: $archive_name"
+    
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        log_error "Архив поврежден или невалиден: $archive_name"
+        return 1
+    fi
+    
+    log_debug "Архив прошел проверку целостности: $archive_name"
+    return 0
+}
 
-# Проверка свободного места на диске
-FREE_SPACE=$(df -m "$BACKUP_BASE" | tail -1 | awk '{print $4}')
-[ "$FREE_SPACE" -lt "$REQUIRED_SPACE" ] && { echo "[$(date)]: Ошибка: Недостаточно места на диске ($FREE_SPACE МБ)" >&2; exit 1; }
+##################################################
+# Проверка размера архивов (защита от пустых архивов)
+check_archive_size() {
+    local archive="$1"
+    local min_size=1024
+    local size
+    size=$(stat -c%s "$archive" 2>/dev/null || echo 0)
+    
+    if [[ $size -lt $min_size ]]; then
+        log_error "Архив подозрительно мал: $archive ($size bytes)"
+        return 1
+    fi
+    
+    return 0
+}
 
-# Создание директорий и подготовка лога
-mkdir -p "$BACKUP_DIR"
-mkdir -p "$MONTHLY_BACKUP_DIR"
-if [ "$CLEAR_BACKUP_DIR" = true ]; then
-    rm -f "$BACKUP_DIR"/*.tar.gz
-    rm -f "$BACKUP_DIR"/*.log
-fi
-: > "$LOG_FILE"  # Перезаписываем лог
-echo "[$(date)]: Новый запуск скрипта резервного копирования CommuniGate" >> "$LOG_FILE"
-echo "[$(date)]: Директория $BACKUP_DIR создана" >> "$LOG_FILE"
+##################################################
+# Валидация всех созданных архивов
+validate_all_archives() {
+    log_message "Начинаю валидацию созданных архивов..."
+    local invalid_count=0
+    local total_archives=0
+    
+    for archive in "$TODAY_DIR"/*.tar.gz; do
+        [[ -f "$archive" ]] || continue
+        ((total_archives++))
+        
+        if ! verify_archive "$archive" || ! check_archive_size "$archive"; then
+            ((invalid_count++))
+            # Помечаем проблемный архив
+            mv "$archive" "${archive}.INVALID" 2>/dev/null || true
+        fi
+    done
+    
+    if [[ $invalid_count -gt 0 ]]; then
+        log_error "Найдено $invalid_count невалидных архивов из $total_archives"
+        return 1
+    fi
+    
+    log_message "Все $total_archives архивов прошли валидацию успешно"
+    return 0
+}
 
-# Функция логирования
-# Записывает сообщение в лог и, при SHOW_LOG=true, выводит в консоль
-log() {
-    echo "[$(date)]: $1" >> "$LOG_FILE"
-    if [ "$SHOW_LOG" = true ]; then
-        echo "[$(date)]: $1"
+##################################################
+# Обработка прерываний
+cleanup() {
+    log_message "Получен сигнал прерывания. Завершаю работу..."
+    # Помечаем бэкап как неполный
+    local incomplete_dir="${TODAY_DIR}_INCOMPLETE"
+    mv "$TODAY_DIR" "$incomplete_dir" 2>/dev/null || true
+    send_email "INTERRUPTED" "Резервное копирование было прервано сигналом"
+    exit 1
+}
+
+# Регистрируем обработчики сигналов
+trap cleanup SIGTERM SIGINT SIGHUP
+
+##################################################
+# Проверка доступности шары
+##################################################
+# Проверка и монтирование сетевой шары
+check_share_availability() {
+    log_message "Проверяю доступность сетевой шары по пути: $SHARA"
+    
+    # Если точка не смонтирована, пытаемся монтировать
+    if ! mountpoint -q "$SHARA"; then
+        log_message "Точка монтирования $SHARA не активна. Пытаюсь монтировать..."
+        
+        # Проверяем существование директории
+        if [[ ! -d "$SHARA" ]]; then
+            mkdir -p "$SHARA"
+            log_message "Создана директория для монтирования: $SHARA"
+        fi
+        
+        # Пытаемся монтировать (замените на вашу команду монтирования)
+        if mount "$SHARA" 2>/dev/null; then
+            log_message "Шара успешно смонтирована"
+        else
+            log_error "Не удалось смонтировать сетевую шару $SHARA"
+            return 1
+        fi
+    fi
+    
+    # Проверяем возможность записи
+    local test_file
+    test_file="${SHARA}/.write_test_$(date +%s)"
+    if ! touch "$test_file" 2>/dev/null; then
+        log_error "Нет прав на запись в сетевую шару $SHARA."
+        return 1
+    fi
+    rm -f "$test_file"
+    
+    log_message "Сетевая шара доступна и готова к записи."
+    return 0
+}
+
+##################################################
+# Создание архива с механизмом повтора
+create_archive() {
+    local archive_name="$1"
+    local source_path="$2"
+    local archive_path="$TODAY_DIR/${START_TS}_${archive_name}.tar.gz"
+
+    log_message "Архивация: $source_path -> $archive_path"
+
+    # Проверяем, существует ли исходная директория
+    if [[ ! -d "$source_path" ]]; then
+        log_error "Исходная директория не найдена, пропускаю: $source_path"
+        return
+    fi
+    # Проверяем, не пустая ли директория
+    if [[ -z "$(find "$source_path" -mindepth 1 -print -quit)" ]]; then
+        log_message "Директория пуста, пропускаю: $source_path"
+        return
+    fi
+
+    local attempt
+    local success=false
+    # Цикл повторных попыток
+    for attempt in $(seq 1 "$ARCHIVE_RETRY_COUNT"); do
+        # Пытаемся заархивировать
+        if tar --use-compress-program="pigz -p $(nproc)" -cf "$archive_path" -C / "${source_path:1}"; then
+            # Если успешно, выходим из цикла
+            success=true
+            break
+        fi
+
+        # Если попытка не удалась и она не последняя
+        if [[ "$attempt" -lt "$ARCHIVE_RETRY_COUNT" ]]; then
+            log_message "Попытка $attempt не удалась для $source_path. Повтор через $ARCHIVE_RETRY_DELAY_SECONDS сек..."
+            sleep "$ARCHIVE_RETRY_DELAY_SECONDS"
+        fi
+    done
+
+    # Проверяем итоговый результат
+    if [[ "$success" == "true" ]]; then
+        log_message "Архив успешно создан: $archive_path"
+        SENT_FILES=$((SENT_FILES + 1))
+        local size_bytes
+        size_bytes=$(stat -c%s "$archive_path")
+        TOTAL_SIZE=$((TOTAL_SIZE + size_bytes))
+        SENT_FILES_LIST+="<li>$(basename "$archive_path") ($((size_bytes / 1024 / 1024)) MB)</li>"
+    else
+        # Если все попытки провалились, логируем ошибку
+    log_archive_failure "Ошибка создания архива для $source_path после $ARCHIVE_RETRY_COUNT попыток." "$source_path"
     fi
 }
 
-# Функция отправки email
-# Отправляет уведомление с логом в качестве вложения
+##################################################
+# Архивация Domains (каждая папка отдельно)
+archive_domains() {
+    log_message "Начинаю архивацию доменов из $DOMAINS_DIR"
+    for domain in "$DOMAINS_DIR"/*; do
+        [[ -d "$domain" ]] || continue
+        create_archive "Domains_$(basename "$domain")" "$domain"
+    done
+    log_message "Завершил архивацию доменов."
+}
+
+##################################################
+# Архивация Accounts
+archive_accounts() {
+    log_message "Начинаю архивацию почтовых ящиков из $BASE_DIR/Accounts"
+    local accounts_dir="$BASE_DIR/Accounts"
+    if [[ ! -d "$accounts_dir" ]]; then
+        log_error "Папка $accounts_dir не найдена! Архивация ящиков невозможна."
+        return 1
+    fi
+
+    for user_dir in "$accounts_dir"/*; do
+        [[ -d "$user_dir" ]] || continue
+        create_archive "Account_$(basename "$user_dir")" "$user_dir"
+    done
+    log_message "Завершил архивацию почтовых ящиков."
+}
+
+##################################################
+# Проверка полноты архивации аккаунтов
+check_accounts_archives() {
+    local accounts_dir="$BASE_DIR/Accounts"
+    # Сразу выходим, если директории нет.
+    [[ -d "$accounts_dir" ]] || return
+
+    mapfile -t user_dirs < <(find "$accounts_dir" -mindepth 1 -maxdepth 1 -type d)
+    mapfile -t archives < <(find "$TODAY_DIR" -maxdepth 1 -type f -name "*_Account_*.tar.gz")
+
+    log_message "Найдено пользователей в $accounts_dir: ${#user_dirs[@]}"
+    log_message "Создано архивов Account_*: ${#archives[@]}"
+
+    if (( ${#user_dirs[@]} != ${#archives[@]} )); then
+        log_error "Внимание! Количество архивов аккаунтов не совпадает с количеством папок пользователей."
+        local missing=()
+        for user_path in "${user_dirs[@]}"; do
+            local user_name
+            user_name=$(basename "$user_path")
+            # Используем glob для поиска, т.к. START_TS известен.
+            if ! ls "${TODAY_DIR}/${START_TS}_Account_${user_name}.tar.gz" >/dev/null 2>&1; then
+                missing+=("$user_name")
+            fi
+        done
+
+        if (( ${#missing[@]} > 0 )); then
+            ACCOUNTS_MISSING_ARCHIVES=$(IFS=,; echo "${missing[*]}")
+            log_error "Не созданы архивы для пользователей: $ACCOUNTS_MISSING_ARCHIVES"
+        fi
+    else
+        log_message "Все папки пользователей успешно заархивированы."
+    fi
+}
+
+##################################################
+# Архивация остальных папок из массива FOLDER_BASE
+archive_other_folders() {
+    log_message "Начинаю архивацию системных папок"
+    for folder in "${FOLDER_BASE[@]}"; do
+        create_archive "$(basename "$folder")" "$folder"
+    done
+    log_message "Завершил архивацию системных папок."
+}
+
+##################################################
+# Ежемесячное копирование
+monthly_archive() {
+    if [[ "$(date +%d)" != "01" ]]; then
+        return
+    fi
+    log_message "Первое число месяца. Выполняется ежемесячное копирование."
+    local monthly_dir="$MONTHLY_BACKUP_DIR/$TODAY"
+    mkdir -p "$monthly_dir"
+    # Копируем созданные СЕГОДНЯ архивы
+    if ! cp -aL "$TODAY_DIR"/* "$monthly_dir/"; then
+        log_error "Ошибка при копировании архивов в ежемесячную папку $monthly_dir"
+    else
+        log_message "Ежемесячный бэкап успешно скопирован в $monthly_dir"
+    fi
+}
+
+##################################################
+# Загрузка архивов на сетевую шару (универсальная): src -> dst, label для логов
+upload_to_shara() {
+    local src="${1:-$BACKUP_BASE}"
+    local dst="${2:-${SHARA}${SHARA_DIR_DAY}}"
+    local label="${3:-Дневные}"
+
+    log_message "Начинаю загрузку ${label,,} архивов на сетевую шару"
+
+    if ! check_share_availability; then
+        log_error "Сетевая шара недоступна — ${label,,} архивы остаются только локально"
+        return 1
+    fi
+
+    mkdir -p "$dst"
+
+    if [[ -z "$(find "$src" -name '*.tar.gz' -type f 2>/dev/null)" ]]; then
+        log_message "Архивы для загрузки не найдены в $src"
+        return 1
+    fi
+
+    if rsync -avz --delete --timeout=300 "$src/" "$dst/"; then
+        log_message "${label} архивы успешно загружены на сетевую шару."
+        return 0
+    else
+        log_error "Ошибка при загрузке ${label,,} архивов на сетевую шару."
+        return 1
+    fi
+}
+
+##################################################
+# Ротация архивов по количеству
+rotate_by_count() {
+    local path="$1"
+    local max_keep="$2"
+    log_message "Ротация: оставляем $max_keep последних бэкапов в $path"
+    local dirs_to_delete
+    mapfile -t dirs_to_delete < <(find "$path" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$((max_keep + 1)))
+    if (( ${#dirs_to_delete[@]} > 0 )); then
+        log_message "Найдено ${#dirs_to_delete[@]} старых директорий для удаления."
+        for old_dir in "${dirs_to_delete[@]}"; do
+            if [[ -d "$old_dir" ]]; then
+                rm -rf "$old_dir"
+                log_message "Удалена старая папка: $old_dir"
+            fi
+        done
+    else
+        log_message "Ротация не требуется."
+    fi
+}
+
+##################################################
+# Ротация логов
+rotate_logs() {
+    local max_keep=14
+    log_message "Ротация логов в $LOG_DIR (оставляем $max_keep файлов)"
+    find "$LOG_DIR" -type f -name 'backup_*.log' | sort -r | tail -n +$((max_keep + 1)) | xargs -r rm -f
+}
+
+##################################################
+# Проверка свободного места
+check_free_space() {
+    log_message "Проверка свободного места..."
+    free_space=$(df -m "$BACKUP_BASE" | tail -1 | awk '{print $4}')
+    log_message "Свободное место для бэкапов: ${free_space} МБ."
+    if (( free_space < REQUIRED_SPACE )); then
+        log_error "Недостаточно места на диске ($free_space МБ), требуется минимум $REQUIRED_SPACE МБ"
+        send_email "FATAL" "Недостаточно места на диске для создания бэкапа: $free_space МБ. Процесс прерван."
+        exit 1
+    fi
+}
+
+##################################################
+# Отправка почты
 send_email() {
-    local message="$1"
-    local subject="$2"
-    local attach_log="$3"
-    local boundary="=====MULTIPART_BOUNDARY_$(date +%s)====="
-    local temp_file="/tmp/mail_$(date +%s).eml"
+    local status="$1"
+    local message="$2"
+    local subject
+    subject="[CommuniGate Backup] $status: $MAIN_DOMAIN - $(date +%F)"
+    local total_size_mb
+    total_size_mb=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
 
-    {
-        echo "From: \"Backup Script\" <$POSTMASTER_NAME>"
-        echo "To: $NOTIFICATION_EMAIL"
-        echo "Subject: $subject"
-        echo "Date: $(date -R)"
-        echo "Message-ID: <$(date +%s)>"
-        echo "MIME-Version: 1.0"
-        echo "Content-Type: multipart/mixed; boundary=\"$boundary\""
-        echo ""
-        echo "--$boundary"
-        echo "Content-Type: text/plain; charset=utf-8"
-        echo "Content-Transfer-Encoding: 8bit"
-        echo ""
-        echo -e "$message"
-        echo ""
-        echo "--$boundary"
-        echo "Content-Type: application/octet-stream; name=\"$(basename "$LOG_FILE")\""
-        echo "Content-Transfer-Encoding: base64"
-        echo "Content-Disposition: attachment; filename=\"$(basename "$LOG_FILE")\""
-        echo ""
-        base64 "$LOG_FILE"
-        echo ""
-        echo "--$boundary--"
-    } > "$temp_file"
-
-    curl --url "smtp://$SMTP_SERVER" \
-         --mail-from "$POSTMASTER_NAME" \
-         --mail-rcpt "$NOTIFICATION_EMAIL" \
-         --upload-file "$temp_file" >> "$LOG_FILE" 2>&1
-
-    if [ $? -ne 0 ]; then
-        log "Критическая ошибка: Не удалось отправить уведомление на $NOTIFICATION_EMAIL"
-        rm -f "$temp_file"
-        exit 1
+    # Добавляем детальный список ошибок в письмо.
+    local error_details=""
+    if (( ${#ERRORS_IN_RUN[@]} > 0 )); then
+        error_details+="<h3>Errors and Warnings</h3>"
+        error_details+="<pre style='background-color:#f8d7da; color:#721c24; padding:10px; border:1px solid #f5c6cb; border-radius:5px;'>"
+        for error in "${ERRORS_IN_RUN[@]}"; do
+            error_details+="$error<br>"
+        done
+        error_details+="</pre>"
     fi
-    log "Уведомление отправлено на $NOTIFICATION_EMAIL"
-    rm -f "$temp_file"
+
+    local html_body
+    html_body=$(cat <<EOF
+<html>
+<body style="font-family: Arial, sans-serif;">
+<h2>Отчёт о резервном копировании CommuniGate</h2>
+<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>
+  <tr style="background-color: #f2f2f2;"><th>Параметр</th><th>Значение</th></tr>
+  <tr><td><b>Статус</b></td><td><b>${status}</b></td></tr>
+  <tr><td>Сообщение</td><td>${message}</td></tr>
+  <tr><td>Время начала</td><td>${START_TS}</td></tr>
+  <tr><td>Время окончания</td><td>$(date '+%Y-%m-%d %H:%M:%S')</td></tr>
+  <tr><td>Создано архивов</td><td>${SENT_FILES}</td></tr>
+  <tr><td>Общий размер</td><td>${total_size_mb} MB</td></tr>
+  <tr><td>Свободно на диске</td><td>${free_space} МБ</td></tr>
+  ${ACCOUNTS_MISSING_ARCHIVES:+"<tr><td>Пропущенные аккаунты</td><td style='color:red;'>${ACCOUNTS_MISSING_ARCHIVES}</td></tr>"}
+</table>
+<h3>Список созданных архивов</h3>
+<ul>${SENT_FILES_LIST:-"<li>Архивы не созданы</li>"}</ul>
+${error_details}
+${FAILED_ARCHIVES_LIST:+<h3>Не удалось заархивировать</h3><ul>${FAILED_ARCHIVES_LIST}</ul>}
+<p>Полный лог-файл доступен на сервере: ${LOG_FILE}</p>
+</body>
+</html>
+EOF
+)
+    # Отправляем письмо через curl
+    (
+        echo "From: CommuniGate Backup <$EMAIL_FROM>"
+        echo "To: <$EMAIL_TO>"
+        echo "Subject: $subject"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/html; charset=UTF-8"
+        echo
+        echo "$html_body"
+    ) | if ! curl -s --url "$SMTP_SERVER" --mail-from "$EMAIL_FROM" --mail-rcpt "$EMAIL_TO" --upload-file - >> "$LOG_FILE" 2>&1; then
+        log_error "Не удалось отправить email уведомление."
+    else
+        log_message "Email уведомление успешно отправлено."
+    fi
+# для использования с аутентификацией. нужное заменить:
+# curl -s --url "$SMTP_SERVER" --mail-from "$EMAIL_FROM" --mail-rcpt "$EMAIL_TO" --user "$SMTP_USER:$SMTP_PASS" --upload-file - >> "$LOG_FILE" 2>&1
+# для использования без аутентификацией. нужное заменить:
+# curl -s --url "$SMTP_SERVER" --mail-from "$EMAIL_FROM" --mail-rcpt "$EMAIL_TO" --upload-file - >> "$LOG_FILE" 2>&1; then   
 }
 
-# -------------------- ОЧИСТКА СТАРЫХ АРХИВОВ --------------------
-# Удаление локальных папок старше RETENTION_DAYS
-log "Очистка локальных архивов старше $RETENTION_DAYS дней..."
-find "$BACKUP_BASE" -maxdepth 1 -type d -name "20[0-9][0-9]-[0-1][0-9]-[0-3][0-9]" -mtime +"$RETENTION_DAYS" -exec rm -rf {} + 2>> "$LOG_FILE" && \
-    log "Локальные старые архивы удалены" || \
-    log "Ошибка при очистке локальных архивов"
 
-# Очистка старых месячных архивов (только 1-го числа)
-if [ "$DAY_OF_MONTH" = "01" ]; then
-    log "Очистка месячных архивов, оставляем только $MONTHLY_RETENTION последних..."
-    find "$MONTHLY_BACKUP_DIR" -type f -name "*.tar.gz" -printf "%T@\t%p\n" | sort -nr | tail -n +$((MONTHLY_RETENTION+1)) | cut -f2- | xargs -I {} rm -f {} 2>> "$LOG_FILE" && \
-        log "Старые месячные архивы удалены" || \
-        log "Ошибка при очистке месячных архивов"
-else
-    log "Сегодня не 1-е число, пропуск создания и ротации месячных архивов"
-fi
 
-# -------------------- АРХИВАЦИЯ --------------------
-log "Начинаем этап архивации..."
-cd "$BASE_DIR" || { log "Ошибка: не удалось перейти в $BASE_DIR"; send_email "Ошибка: Не удалось перейти в $BASE_DIR\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true; exit 1; }
 
-# Архив /Accounts
-if [ -d "$BASE_DIR/Accounts" ]; then
-    ARCHIVE_ACCOUNTS="$BACKUP_DIR/${TODAY}-${TIMESTAMP}_Accounts_${MAIN_DOMAIN}.tar.gz"
-    MONTHLY_ARCHIVE_ACCOUNTS="$MONTHLY_BACKUP_DIR/${TODAY}-Monthly_Accounts_${MAIN_DOMAIN}.tar.gz"
-    if [ "$USE_PIGZ" = true ]; then
-        if tar -cf - Accounts 2>> "$LOG_FILE" | pigz > "$ARCHIVE_ACCOUNTS"; then
-            if tar -tzf "$ARCHIVE_ACCOUNTS" >/dev/null 2>> "$LOG_FILE"; then
-                log "Архив создан и проверен: $ARCHIVE_ACCOUNTS (с pigz)"
-                [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_ACCOUNTS" "$MONTHLY_ARCHIVE_ACCOUNTS" && log "Месячный архив создан: $MONTHLY_ARCHIVE_ACCOUNTS"
-            else
-                log "Ошибка: Архив $ARCHIVE_ACCOUNTS поврежден"
-                send_email "Ошибка: Архив $ARCHIVE_ACCOUNTS поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        else
-            log "Ошибка создания архива Accounts"
-            send_email "Ошибка: Не удалось создать архив Accounts\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-            exit 1
-        fi
-    else
-        if tar -czf "$ARCHIVE_ACCOUNTS" Accounts 2>> "$LOG_FILE"; then
-            if tar -tzf "$ARCHIVE_ACCOUNTS" >/dev/null 2>> "$LOG_FILE"; then
-                log "Архив создан и проверен: $ARCHIVE_ACCOUNTS (с gzip)"
-                [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_ACCOUNTS" "$MONTHLY_ARCHIVE_ACCOUNTS" && log "Месячный архив создан: $MONTHLY_ARCHIVE_ACCOUNTS"
-            else
-                log "Ошибка: Архив $ARCHIVE_ACCOUNTS поврежден"
-                send_email "Ошибка: Архив $ARCHIVE_ACCOUNTS поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        else
-            log "Ошибка создания архива Accounts"
-            send_email "Ошибка: Не удалось создать архив Accounts\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-            exit 1
-        fi
+##################################################
+# Главная функция
+main() {
+    # Создаем директории и настраиваем логирование
+    mkdir -p "$TODAY_DIR" "$LOG_DIR"
+    
+    # Регистрируем обработчики сигналов ПЕРВЫМ ДЕЛОМ
+    trap cleanup SIGTERM SIGINT SIGHUP
+    
+    # Перенаправляем весь вывод в лог и на консоль
+    exec &> >(tee -a "$LOG_FILE")
+    
+    log_message "=== НАЧАЛО РЕЗЕРВНОГО КОПИРОВАНИЯ ==="
+
+    check_dependencies
+    check_free_space
+
+    # --- Создание архивов ---
+    archive_accounts
+    archive_domains
+    archive_other_folders
+    check_accounts_archives
+    # --- Проверка архивов ---
+    validate_all_archives
+
+    # Более надёжная проверка, были ли созданы архивы.
+    if ! find "$TODAY_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit | grep -q .; then
+        log_error "Ни одного архива не было создано. Процесс прерван."
+        send_email "FATAL" "Резервное копирование провалилось: ни одного архива не создано."
+        exit 1
     fi
-else
-    log "Директория $BASE_DIR/Accounts не найдена"
-fi
+    log_message "Архивы успешно созданы. Всего: $SENT_FILES шт."
 
-# Архив /SystemLogs
-if [ -d "$BASE_DIR/SystemLogs" ]; then
-    ARCHIVE_LOGS="$BACKUP_DIR/${TODAY}-${TIMESTAMP}_SystemLogs.tar.gz"
-    MONTHLY_ARCHIVE_LOGS="$MONTHLY_BACKUP_DIR/${TODAY}-Monthly_SystemLogs.tar.gz"
-    if [ "$USE_PIGZ" = true ]; then
-        if tar -cf - SystemLogs 2>> "$LOG_FILE" | pigz > "$ARCHIVE_LOGS"; then
-            if tar -tzf "$ARCHIVE_LOGS" >/dev/null 2>> "$LOG_FILE"; then
-                log "Архив создан и проверен: $ARCHIVE_LOGS (с pigz)"
-                [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_LOGS" "$MONTHLY_ARCHIVE_LOGS" && log "Месячный архив создан: $MONTHLY_ARCHIVE_LOGS"
-            else
-                log "Ошибка: Архив $ARCHIVE_LOGS поврежден"
-                send_email "Ошибка: Архив $ARCHIVE_LOGS поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        else
-            log "Ошибка создания архива SystemLogs"
-            send_email "Ошибка: Не удалось создать архив SystemLogs\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-            exit 1
-        fi
-    else
-        if tar -czf "$ARCHIVE_LOGS" SystemLogs 2>> "$LOG_FILE"; then
-            if tar -tzf "$ARCHIVE_LOGS" >/dev/null 2>> "$LOG_FILE"; then
-                log "Архив создан и проверен: $ARCHIVE_LOGS (с gzip)"
-                [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_LOGS" "$MONTHLY_ARCHIVE_LOGS" && log "Месячный архив создан: $MONTHLY_ARCHIVE_LOGS"
-            else
-                log "Ошибка: Архив $ARCHIVE_LOGS поврежден"
-                send_email "Ошибка: Архив $ARCHIVE_LOGS поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        else
-            log "Ошибка создания архива SystemLogs"
-            send_email "Ошибка: Не удалось создать архив SystemLogs\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-            exit 1
-        fi
+    # --- Ротация и загрузка ---
+    rotate_by_count "$BACKUP_BASE" "$RETENTION_DAYS"
+    upload_to_shara "$BACKUP_BASE" "${SHARA}${SHARA_DIR_DAY}" "Дневные"
+
+    # --- Ежемесячные задачи ---
+    if [[ "$(date +%d)" == "01" ]]; then
+        monthly_archive
+        rotate_by_count "$MONTHLY_BACKUP_DIR" "$MONTHLY_RETENTION"
+        upload_to_shara "$MONTHLY_BACKUP_DIR" "${SHARA}${SHARA_DIR_MONTHLY}" "Месячные"
     fi
-fi
 
-# Архив /Settings
-SETTINGS_DIRS=(CGPClamAV Directory Settings Submitted)
-SETTINGS_TO_ARCHIVE=()
-for dir in "${SETTINGS_DIRS[@]}"; do
-    [ -d "$dir" ] && SETTINGS_TO_ARCHIVE+=("$dir")
-done
-if [ ${#SETTINGS_TO_ARCHIVE[@]} -gt 0 ]; then
-    ARCHIVE_SETTINGS="$BACKUP_DIR/${TODAY}-${TIMESTAMP}_Settings.tar.gz"
-    MONTHLY_ARCHIVE_SETTINGS="$MONTHLY_BACKUP_DIR/${TODAY}-Monthly_Settings.tar.gz"
-    if [ "$USE_PIGZ" = true ]; then
-        if tar -cf - "${SETTINGS_TO_ARCHIVE[@]}" 2>> "$LOG_FILE" | pigz > "$ARCHIVE_SETTINGS"; then
-            if tar -tzf "$ARCHIVE_SETTINGS" >/dev/null 2>> "$LOG_FILE"; then
-                log "Архив создан и проверен: $ARCHIVE_SETTINGS (с pigz)"
-                [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_SETTINGS" "$MONTHLY_ARCHIVE_SETTINGS" && log "Месячный архив создан: $MONTHLY_ARCHIVE_SETTINGS"
-            else
-                log "Ошибка: Архив $ARCHIVE_SETTINGS поврежден"
-                send_email "Ошибка: Архив $ARCHIVE_SETTINGS поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        else
-            log "Ошибка создания архива Settings"
-            send_email "Ошибка: Не удалось создать архив Settings\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-            exit 1
-        fi
-    else
-        if tar -czf "$ARCHIVE_SETTINGS" "${SETTINGS_TO_ARCHIVE[@]}" 2>> "$LOG_FILE"; then
-            if tar -tzf "$ARCHIVE_SETTINGS" >/dev/null 2>> "$LOG_FILE"; then
-                log "Архив создан и проверен: $ARCHIVE_SETTINGS (с gzip)"
-                [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_SETTINGS" "$MONTHLY_ARCHIVE_SETTINGS" && log "Месячный архив создан: $MONTHLY_ARCHIVE_SETTINGS"
-            else
-                log "Ошибка: Архив $ARCHIVE_SETTINGS поврежден"
-                send_email "Ошибка: Архив $ARCHIVE_SETTINGS поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        else
-            log "Ошибка создания архива Settings"
-            send_email "Ошибка: Не удалось создать архив Settings\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-            exit 1
-        fi
+    # --- Формирование отчёта ---
+    local final_status="SUCCESS"
+    local final_message="Резервное копирование выполнено успешно."
+    if (( ${#ERRORS_IN_RUN[@]} > 0 )); then
+        final_status="WARNING"
+        final_message="Резервное копирование выполнено с ошибками или предупреждениями."
     fi
-else
-    log "Ни одна из директорий ${SETTINGS_DIRS[*]} не найдена"
-fi
+    send_email "$final_status" "$final_message"
 
-# Архивы по доменам
-if [ -d "$BASE_DIR/Domains" ]; then
-    shopt -s nullglob
-    for domain in "$BASE_DIR"/Domains/*; do
-        [ -d "$domain" ] || continue
-        [ "$(ls -A "$domain")" ] || { log "Пропущен пустой домен: $(basename "$domain")"; continue; }
-        DOMAIN_NAME=$(basename "$domain")
-        ARCHIVE_DOMAIN="$BACKUP_DIR/${TODAY}-${TIMESTAMP}_Domains-${DOMAIN_NAME}.tar.gz"
-        MONTHLY_ARCHIVE_DOMAIN="$MONTHLY_BACKUP_DIR/${TODAY}-Monthly_Domains-${DOMAIN_NAME}.tar.gz"
-        if [ "$USE_PIGZ" = true ]; then
-            if tar -cf - -C "$BASE_DIR/Domains" "$DOMAIN_NAME" 2>> "$LOG_FILE" | pigz > "$ARCHIVE_DOMAIN"; then
-                if tar -tzf "$ARCHIVE_DOMAIN" >/dev/null 2>> "$LOG_FILE"; then
-                    log "Архив создан и проверен: $ARCHIVE_DOMAIN (с pigz)"
-                    [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_DOMAIN" "$MONTHLY_ARCHIVE_DOMAIN" && log "Месячный архив создан: $MONTHLY_ARCHIVE_DOMAIN"
-                else
-                    log "Ошибка: Архив $ARCHIVE_DOMAIN поврежден"
-                    send_email "Ошибка: Архив $ARCHIVE_DOMAIN поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                    exit 1
-                fi
-            else
-                log "Ошибка архивации домена: $DOMAIN_NAME"
-                send_email "Ошибка: Не удалось создать архив домена $DOMAIN_NAME\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        else
-            if tar -czf "$ARCHIVE_DOMAIN" -C "$BASE_DIR/Domains" "$DOMAIN_NAME" 2>> "$LOG_FILE"; then
-                if tar -tzf "$ARCHIVE_DOMAIN" >/dev/null 2>> "$LOG_FILE"; then
-                    log "Архив создан и проверен: $ARCHIVE_DOMAIN (с gzip)"
-                    [ "$DAY_OF_MONTH" = "01" ] && cp "$ARCHIVE_DOMAIN" "$MONTHLY_ARCHIVE_DOMAIN" && log "Месячный архив создан: $MONTHLY_ARCHIVE_DOMAIN"
-                else
-                    log "Ошибка: Архив $ARCHIVE_DOMAIN поврежден"
-                    send_email "Ошибка: Архив $ARCHIVE_DOMAIN поврежден\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                    exit 1
-                fi
-            else
-                log "Ошибка архивации домена: $DOMAIN_NAME"
-                send_email "Ошибка: Не удалось создать архив домена $DOMAIN_NAME\nСм. лог файл." "Ошибка резервного копирования CommuniGate $TODAY" true
-                exit 1
-            fi
-        fi
-    done
-    shopt -u nullglob
-fi
+    rotate_logs
+    log_message "=== ЗАВЕРШЕНИЕ РЕЗЕРВНОГО КОПИРОВАНИЯ ==="
+}
 
-log "Этап архивации завершён"
-
-# -------------------- FTP ОТПРАВКА --------------------
-FTP_FAILED=false
-log "Проверка доступности FTP-сервера..."
-FTP_TEST_FILE="test_ftp_connection.txt"
-echo "Test $(date)" > "$BACKUP_DIR/$FTP_TEST_FILE"
-
-curl --connect-timeout 30 --max-time 600 --ftp-create-dirs -T "$BACKUP_DIR/$FTP_TEST_FILE" \
-     "$FTP_URL$FTP_TARGET_DIR/$FTP_TEST_FILE" \
-     --user "$FTP_USER:$FTP_PASS" --verbose 2>> "$LOG_FILE"
-
-if [ $? -eq 0 ]; then
-    log "FTP доступен. Отправка архивов..."
-    for file in "$BACKUP_DIR"/*.tar.gz; do
-        curl --connect-timeout 30 --max-time 600 --ftp-create-dirs -T "$file" \
-             "$FTP_URL$FTP_TARGET_DIR/$(basename "$file")" \
-             --user "$FTP_USER:$FTP_PASS" --verbose 2>> "$LOG_FILE"
-        if [ $? -eq 0 ]; then
-            log "Отправлен на FTP: $(basename "$file")"
-        else
-            log "Ошибка отправки файла на FTP: $(basename "$file")"
-            FTP_FAILED=true
-        fi
-    done
-else
-    log "Ошибка подключения к FTP серверу"
-    FTP_FAILED=true
-fi
-
-# Удаление тестового файла с FTP
-curl --connect-timeout 30 --max-time 600 -Q "DELE $FTP_TARGET_DIR/$FTP_TEST_FILE" \
-     "$FTP_URL$FTP_TARGET_DIR/" \
-     --user "$FTP_USER:$FTP_PASS" --verbose 2>> "$LOG_FILE" && \
-    log "Тестовый файл $FTP_TEST_FILE удален с FTP" || \
-    log "Ошибка удаления тестового файла $FTP_TEST_FILE с FTP"
-
-rm -f "$BACKUP_DIR/$FTP_TEST_FILE"
-
-# Отправка лога на FTP
-LOG_TEMP="/tmp/backup.log.$(date +%s)"
-cp "$LOG_FILE" "$LOG_TEMP"
-curl --connect-timeout 30 --max-time 600 --ftp-create-dirs -T "$LOG_TEMP" \
-     "$FTP_URL$FTP_TARGET_DIR/$(basename "$LOG_FILE")" \
-     --user "$FTP_USER:$FTP_PASS" --verbose 2>> "$LOG_FILE"
-if [ $? -eq 0 ]; then
-    log "Отправлен на FTP: $(basename "$LOG_FILE")"
-else
-    log "Ошибка отправки файла на FTP: $(basename "$LOG_FILE")"
-    FTP_FAILED=true
-fi
-rm -f "$LOG_TEMP"
-
-# Очистка старых папок на FTP
-log "Очистка старых папок на FTP старше $RETENTION_DAYS дней..."
-FTP_LIST=$(curl --connect-timeout 30 --max-time 600 --list-only \
-     "$FTP_URL$FTP_BASE_DIR/" \
-     --user "$FTP_USER:$FTP_PASS" 2>> "$LOG_FILE" | grep -E '^[0-9]{4}-[0-1][0-9]-[0-3][0-9]$')
-log "Найдены FTP папки: ${FTP_LIST:-<пусто>}"
-if [ -z "$FTP_LIST" ]; then
-    log "Нет папок для удаления на FTP"
-else
-    DELETED=false
-    for dir in $FTP_LIST; do
-        dir_date=$(date -d "$dir" +%s 2>/dev/null)
-        current_date=$(date +%s)
-        if [ $(( (current_date - dir_date) / 86400 )) -gt $RETENTION_DAYS ]; then
-            log "Попытка удалить папку $FTP_BASE_DIR/$dir..."
-            curl --connect-timeout 30 --max-time 600 -Q "RMD $FTP_BASE_DIR/$dir" \
-                 "$FTP_URL$FTP_BASE_DIR/" \
-                 --user "$FTP_USER:$FTP_PASS" --verbose 2>> "$LOG_FILE" && \
-                log "Папка $FTP_BASE_DIR/$dir удалена с FTP" || \
-                log "Ошибка удаления папки $FTP_BASE_DIR/$dir с FTP"
-            DELETED=true
-        fi
-    done
-    if [ "$DELETED" = false ]; then
-        log "Нет папок старше $RETENTION_DAYS дней для удаления"
-    fi
-fi
-
-# -------------------- EMAIL УВЕДОМЛЕНИЕ --------------------
-log "Отправка уведомления на почту..."
-message="Резервное копирование завершено.\nДата: $TODAY\nВремя: $TIMESTAMP\nКаталог: $BACKUP_DIR\nСвободное место на диске: $FREE_SPACE МБ"
-[ "$FTP_FAILED" = true ] && message+="\n\n⚠️ Отправка на FTP не удалась. См. лог файл."
-
-send_email "$message" "Резервное копирование CommuniGate $TODAY" true
-
-log "Скрипт завершён."
-exit 0
+##################################################
+# Запуск
+main "$@"
