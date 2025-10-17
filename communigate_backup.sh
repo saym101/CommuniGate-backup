@@ -86,6 +86,7 @@ TOTAL_SIZE=0
 ERRORS_IN_RUN=()
 free_space=0
 ACCOUNTS_MISSING_ARCHIVES="" # Хранит список пропущенных пользователей
+CRITICAL_ERROR=false  # Добавляем эту переменную
 
 ##################################################
 # Логирование
@@ -206,12 +207,19 @@ cleanup() {
     # Помечаем бэкап как неполный
     local incomplete_dir="${TODAY_DIR}_INCOMPLETE"
     mv "$TODAY_DIR" "$incomplete_dir" 2>/dev/null || true
-    send_email "INTERRUPTED" "Резервное копирование было прервано сигналом"
+    
+    local status="INTERRUPTED"
+    local message="Резервное копирование было прервано сигналом"
+    
+    # Если была критическая ошибка до прерывания
+    if [[ "$CRITICAL_ERROR" == "true" ]]; then
+        status="CRITICAL_INTERRUPTED"
+        message="Резервное копирование было прервано после критической ошибки загрузки на шару"
+    fi
+    
+    send_email "$status" "$message"
     exit 1
 }
-
-# Регистрируем обработчики сигналов
-trap cleanup SIGTERM SIGINT SIGHUP
 
 ##################################################
 # Проверка доступности шары
@@ -249,6 +257,31 @@ check_share_availability() {
     rm -f "$test_file"
     
     log_message "Сетевая шара доступна и готова к записи."
+    return 0
+}
+
+##################################################
+# Проверка свободного места на шаре
+check_share_space() {
+    log_message "Проверка свободного места на сетевой шаре..."
+    
+    if ! check_share_availability; then
+        log_error "Невозможно проверить место на шаре - шара недоступна"
+        return 1
+    fi
+    
+    local share_space
+    share_space=$(df -m "$SHARA" | tail -1 | awk '{print $4}')
+    log_message "Свободное место на шаре: ${share_space} МБ."
+    
+    # Проверяем, достаточно ли места (например, минимум 5GB)
+    local required_share_space=5000
+    if (( share_space < required_share_space )); then
+        log_error "Недостаточно места на сетевой шаре ($share_space МБ), требуется минимум $required_share_space МБ"
+        CRITICAL_ERROR=true
+        return 1
+    fi
+    
     return 0
 }
 
@@ -404,6 +437,7 @@ upload_to_shara() {
 
     if ! check_share_availability; then
         log_error "Сетевая шара недоступна — ${label,,} архивы остаются только локально"
+        CRITICAL_ERROR=true  # Устанавливаем флаг критической ошибки
         return 1
     fi
 
@@ -419,6 +453,7 @@ upload_to_shara() {
         return 0
     else
         log_error "Ошибка при загрузке ${label,,} архивов на сетевую шару."
+        CRITICAL_ERROR=true  # Устанавливаем флаг критической ошибки
         return 1
     fi
 }
@@ -569,28 +604,47 @@ main() {
 
     # --- Ротация и загрузка ---
     rotate_by_count "$BACKUP_BASE" "$RETENTION_DAYS"
-    upload_to_shara "$BACKUP_BASE" "${SHARA}${SHARA_DIR_DAY}" "Дневные"
+    
+    # Проверяем место на шаре перед загрузкой
+    if check_share_space; then
+        upload_to_shara "$BACKUP_BASE" "${SHARA}${SHARA_DIR_DAY}" "Дневные"
+    else
+        log_error "Пропускаю загрузку на шару из-за нехватки места"
+    fi
 
     # --- Ежемесячные задачи ---
     if [[ "$(date +%d)" == "01" ]]; then
         monthly_archive
         rotate_by_count "$MONTHLY_BACKUP_DIR" "$MONTHLY_RETENTION"
-        upload_to_shara "$MONTHLY_BACKUP_DIR" "${SHARA}${SHARA_DIR_MONTHLY}" "Месячные"
+        if check_share_space; then
+            upload_to_shara "$MONTHLY_BACKUP_DIR" "${SHARA}${SHARA_DIR_MONTHLY}" "Месячные"
+        else
+            log_error "Пропускаю загрузку месячных архивов на шару из-за нехватки места"
+        fi
     fi
 
     # --- Формирование отчёта ---
     local final_status="SUCCESS"
     local final_message="Резервное копирование выполнено успешно."
-    if (( ${#ERRORS_IN_RUN[@]} > 0 )); then
+    
+    if [[ "$CRITICAL_ERROR" == "true" ]]; then
+        final_status="CRITICAL"
+        final_message="Резервное копирование завершено с КРИТИЧЕСКИМИ ошибками (проблемы с загрузкой на шару)."
+    elif (( ${#ERRORS_IN_RUN[@]} > 0 )); then
         final_status="WARNING"
         final_message="Резервное копирование выполнено с ошибками или предупреждениями."
     fi
+    
     send_email "$final_status" "$final_message"
 
     rotate_logs
     log_message "=== ЗАВЕРШЕНИЕ РЕЗЕРВНОГО КОПИРОВАНИЯ ==="
+    
+    # Если была критическая ошибка, завершаем с ненулевым кодом
+    if [[ "$CRITICAL_ERROR" == "true" ]]; then
+        exit 1
+    fi
 }
-
 ##################################################
 # Запуск
 main "$@"
