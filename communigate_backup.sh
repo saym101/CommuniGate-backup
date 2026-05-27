@@ -11,13 +11,6 @@
 # Скрипт сам НЕ монтирует удалённое хранилище.
 # Монтирование должно быть настроено отдельно через /etc/fstab, systemd, autofs,
 # rclone service или другой удобный способ.
-#
-# Перед публикацией на GitHub замените:
-#   MAIN_DOMAIN
-#   EMAIL_TO
-#   EMAIL_FROM
-#   REMOTE_BACKUP_ROOT
-# на обезличенные значения example.com / admin@example.com / /mnt/communigate_backup.
 
 set -euo pipefail
 IFS=$'\n\t'
