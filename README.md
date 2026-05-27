@@ -1,133 +1,707 @@
-# Скрипт резервного копирования CommuniGate Pro
+# CommuniGate Pro Backup Script
 
-![Version](https://img.shields.io/badge/version-3.4-blue)
+![Version](https://img.shields.io/badge/version-4.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Debian%2FUbuntu-orange)
+![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
 
-Этот Bash-скрипт предназначен для автоматизации резервного копирования данных сервера CommuniGate Pro. Скрипт создает ежедневные и месячные резервные копии, загружает их на FTP-сервер, управляет сроками хранения и отправляет уведомления по email с подробными логами.
+Bash-скрипт для резервного копирования данных **CommuniGate Pro** на Linux-сервере.
 
-## Возможности
+Скрипт создаёт ежедневные архивы локально, при необходимости создаёт месячную копию, дополнительно переносит архивы в указанное хранилище и отправляет email-отчёт.
 
-- **Ежедневные резервные копии**: Архивирует директории `Accounts`, `SystemLogs`, `Settings` и отдельные домены (`Domains`) при их наличии, в сжатые файлы `.tar.gz`.
-- **Месячные резервные копии**: Создает архивы 1-го числа каждого месяца, сохраняя до двух последних наборов.
-- **Управление хранением**:
-  - Удаляет локальные ежедневные архивы старше 7 дней.
-  - Удаляет папки на FTP старше 7 дней.
-  - Сохраняет только два последних набора месячных архивов.
-- **Загрузка на FTP**: Безопасно отправляет архивы и логи на указанный FTP-сервер с автоматическим созданием директорий. Поддерживает нестандартные порты.
-- **Уведомления по email**: Отправляет подробные отчеты через SMTP с логами во вложении.
-- **Сжатие**: Использует `pigz` для ускоренного сжатия, если доступно, или `gzip` в противном случае.
-- **Обработка ошибок**: Проверяет целостность архивов, контролирует свободное место на диске и логирует все операции.
-- **Настраиваемость**: Легко редактируемая секция конфигурации для путей, FTP, email и сроков хранения.
+## Что делает скрипт
 
-## Требования
+1. Создаёт локальные архивы в:
 
-- **Операционная система**: Linux/Unix с Bash.
-- **Зависимости**:
-  - `bash`, `tar`, `curl`, `base64` (обязательно).
-  - `pigz` (опционально, для ускоренного сжатия). (apt install pigz)
-- **Права доступа**: Чтение директории данных CommuniGate, запись в директорию для резервных копий.
-- **Сеть**: Доступ к FTP-серверу и SMTP-серверу для загрузки и отправки уведомлений.
-
-## Установка
-
-1. **Скачайте скрипт**:
-   ```bash
-   wget https://github.com/saym101/CommuniGate-backup/raw/refs/heads/main/communigate_backup.sh
+   ```text
+   /backups/CommuniGate/Day/YYYY-MM-DD
    ```
 
-2. **Установите права на выполнение**:
-   ```bash
-   chmod +x communigate_backup.sh
+2. Первого числа месяца или при запуске с ключом `--monthly` создаёт месячную копию в:
+
+   ```text
+   /backups/CommuniGate/Monthly/YYYY-MM-DD
    ```
 
-3. **Настройте конфигурацию**:
-   Откройте `communigate_backup.sh` в текстовом редакторе и заполните секцию **Конфигурация пользователя** в начале файла. Основные переменные:
-   - `BASE_DIR`: Путь к данным CommuniGate (например, `/var/CommuniGate`).
-   - `BACKUP_BASE`: Локальная директория для резервных копий (например, `/backups/CommuniGate`).
-   - `FTP_SERVER`, `FTP_PORT`, `FTP_USER`, `FTP_PASS`: Данные для доступа к FTP. Укажите `FTP_PORT`, если порт отличается от 21.
-   - `FTP_BASE_DIR`: Путь на FTP для архивов (например, `/backups/CommuniGate`).
-   - `NOTIFICATION_EMAIL`, `POSTMASTER_NAME`, `SMTP_SERVER`: Настройки email.
-   - `MAIN_DOMAIN`: Основной домен для имени архива `Accounts` (например, `example.com`).
+3. Дополнительно копирует архивы в удалённое или внешнее хранилище, указанное в переменной:
 
-   Пример:
    ```bash
-   BASE_DIR="/var/CommuniGate"
-   BACKUP_BASE="/backups/CommuniGate"
-   FTP_SERVER="ftp.example.com"
-   FTP_PORT="2121"
-   FTP_USER="ftp_user"
-   FTP_PASS="your_secure_password"
-   FTP_BASE_DIR="/backups"
-   NOTIFICATION_EMAIL="admin@example.com"
-   POSTMASTER_NAME="backup@example.com"
-   SMTP_SERVER="smtp.example.com"
-   MAIN_DOMAIN="example.com"
+   REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
    ```
 
-## Использование
+4. Отправляет HTML-отчёт на email через локальный SMTP:
 
-1. **Тестовый запуск**:
-   Выполните скрипт вручную, чтобы проверить конфигурацию:
    ```bash
-   ./communigate_backup.sh
+   SMTP_SERVER="smtp://127.0.0.1:25"
    ```
 
-2. **Настройка cron**:
-   Добавьте скрипт в `cron` для ежедневного выполнения (например, в 2:00):
-   ```bash
-   crontab -e
-   ```
-   Добавьте строку:
-   ```bash
-   0 2 * * * /path/to/communigate_backup.sh
-   ```
-
-3. **Проверка логов**:
-   - Логи сохраняются в `$BACKUP_BASE/YYYY-MM-DD/backup.log` (например, `/backups/CommuniGate/2025-04-25/backup.log`).
-   - Уведомления по email содержат лог во вложении и отправляются на `NOTIFICATION_EMAIL`.
-
-## Настройки
-
-Скрипт гибко настраивается. Основные параметры в секции **Системные настройки**:
-- `RETENTION_DAYS` (по умолчанию: `7`): Срок хранения ежедневных архивов (локально и на FTP).
-- `MONTHLY_RETENTION` (по умолчанию: `2`): Количество хранимых наборов месячных архивов.
-- `REQUIRED_SPACE` (по умолчанию: `1024` МБ): Минимальное свободное место на диске.
-- `SHOW_LOG` (по умолчанию: `true`): Выводить логи в консоль во время выполнения. ###### НЕ ЗАБЫВАЕМ ОТКЛЮЧАТЬ.
-- `CLEAR_BACKUP_DIR` (по умолчанию: `false`): Очищать директорию ежедневных архивов перед запуском.
-***При текущем значении `CLEAR_BACKUP_DIR=false` скрипт не удаляет файлы, созданные ранее текущей даты в /path/to/backups/ДАТА-АРХИВИРОВАНИЯ/, и просто добавляет новые. Архивы за предыдущие даты и месячные архивы не затрагиваются. Если вы хотите, чтобы скрипт очищал файлы за текущий день перед новым запуском, установите CLEAR_BACKUP_DIR=true.***
-
-В секции **Конфигурация пользователя** обратите внимание на:
-- `FTP_PORT`: Позволяет указать нестандартный порт FTP-сервера (например, `2121`). По умолчанию `21`.
-
-Подробные описания всех переменных см. в комментариях внутри скрипта.
-
-## Структура резервных копий
-
-- **Ежедневные архивы**:
-  - Хранятся в `$BACKUP_BASE/YYYY-MM-DD/` (например, `/backups/CommuniGate/2025-04-25/`).
-  - Файлы: `YYYY-MM-DD-HHMMSS_Accounts_<MAIN_DOMAIN>.tar.gz`, `SystemLogs.tar.gz`, `Settings.tar.gz`, `Domains-<domain>.tar.gz`.
-- **Месячные архивы**:
-  - Хранятся в `$BACKUP_BASE/Monthly/` (например, `/backups/CommuniGate/Monthly/`).
-  - Файлы: `YYYY-MM-DD-Monthly_*.tar.gz`, создаются 1-го числа месяца.
-- **FTP**:
-  - Загружаются в `$FTP_BASE_DIR/YYYY-MM-DD/` (например, `/backups/2025-04-25/`).
-  - Включают все ежедневные архивы и файл `backup.log`.
-
-## Устранение неполадок
-
-- **Логи**: Проверяйте `$BACKUP_BASE/YYYY-MM-DD/backup.log` для анализа ошибок.
-- **Частые проблемы**:
-  - **Ошибки FTP**: Проверьте `FTP_SERVER`, `FTP_PORT`, `FTP_USER`, `FTP_PASS`. Убедитесь, что FTP-сервер доступен на указанном порту.
-  - **Ошибки email**: Проверьте `SMTP_SERVER` и адреса email. Тестируйте SMTP-соединение.
-  - **Ошибки прав доступа**: Убедитесь, что есть права чтения для `BASE_DIR` и записи для `BACKUP_BASE`.
-  - **Недостаток места**: Увеличьте `REQUIRED_SPACE` или освободите место на диске.
-- **Отладка**: Установите `SHOW_LOG=true` для вывода логов в реальном времени.
-
-## Лицензия
-
-Проект распространяется под [лицензией MIT](LICENSE). Вы можете свободно использовать, изменять и распространять скрипт с указанием авторства.
+SMTP-авторизация в скрипте не используется. Скрипт рассчитан на запуск локально на сервере, где работает CommuniGate Pro, Postfix, Exim или другой локальный SMTP-сервис.
 
 ---
 
-**Удачного резервного копирования!**
+## Возможности
+
+- Архивация основных аккаунтов из `Accounts`.
+- Архивация доменных аккаунтов из `Domains`.
+- Архивация системных папок:
+  - `Settings`
+  - `Directory`
+  - `SystemLogs`
+  - `Submitted`
+- Ежедневные локальные архивы.
+- Месячные архивы первого числа месяца.
+- Принудительное создание месячной копии через `--monthly`.
+- Дополнительное копирование в любое доступное хранилище:
+  - NFS
+  - Samba/CIFS
+  - rclone mount
+  - sshfs
+  - внешний диск
+  - обычная локальная папка
+- Проверка свободного места локально и в дополнительном хранилище.
+- Проверка marker-файла, чтобы не писать архивы не туда.
+- Защита от параллельного запуска через `flock`.
+- Поддержка `dry-run`.
+- Email-отчёт через локальный SMTP без логина и пароля.
+- Ротация локальных и remote-копий.
+- Логирование всех важных операций.
+
+---
+
+## Требования
+
+### ОС
+
+Рекомендуется:
+
+```text
+Debian 12
+Ubuntu Server 22.04/24.04
+```
+
+Скрипт должен запускаться от `root`.
+
+### Пакеты
+
+Нужные пакеты:
+
+```bash
+apt update
+apt install -y pigz curl rsync tar bc util-linux
+```
+
+Используемые команды:
+
+```text
+bash
+pigz
+curl
+rsync
+tar
+bc
+flock
+mountpoint
+df
+awk
+find
+sort
+xargs
+mktemp
+sed
+stat
+basename
+chmod
+mkdir
+rm
+mv
+tee
+```
+
+---
+
+## Установка
+
+Скопируйте скрипт на сервер:
+
+```bash
+install -m 700 communigate-backup.sh /usr/local/sbin/communigate-backup.sh
+```
+
+Или вручную:
+
+```bash
+cp communigate-backup.sh /usr/local/sbin/communigate-backup.sh
+chmod 700 /usr/local/sbin/communigate-backup.sh
+```
+
+Проверка синтаксиса:
+
+```bash
+bash -n /usr/local/sbin/communigate-backup.sh
+```
+
+Проверка ShellCheck:
+
+```bash
+shellcheck /usr/local/sbin/communigate-backup.sh
+```
+
+---
+
+## Основные настройки
+
+Настройки находятся в верхней части скрипта.
+
+### Пути CommuniGate Pro
+
+```bash
+BASE_DIR="/var/CommuniGate"
+DIR_ACCOUNTS="$BASE_DIR/Accounts"
+DOMAINS_DIR="$BASE_DIR/Domains"
+```
+
+Обычно для Debian это:
+
+```text
+/var/CommuniGate
+```
+
+### Локальные бэкапы
+
+```bash
+LOCAL_BACKUP_ROOT="/backups/CommuniGate"
+LOCAL_DAY_BASE="$LOCAL_BACKUP_ROOT/Day"
+LOCAL_MONTHLY_BASE="$LOCAL_BACKUP_ROOT/Monthly"
+LOG_DIR="$LOCAL_BACKUP_ROOT/Logs"
+```
+
+Итоговая структура:
+
+```text
+/backups/CommuniGate/
+├── Day/
+│   └── YYYY-MM-DD/
+├── Monthly/
+│   └── YYYY-MM-DD/
+└── Logs/
+```
+
+### Дополнительное хранилище
+
+Скрипт не знает и не должен знать, чем является дополнительное хранилище. Это может быть NFS, Samba/CIFS, rclone mount, sshfs, внешний диск или обычная локальная папка.
+
+Главная переменная:
+
+```bash
+REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
+```
+
+Структура внутри дополнительного хранилища:
+
+```text
+/mnt/communigate_backup/
+└── CommuniGate/
+    ├── Day/
+    ├── Monthly/
+    └── Logs/
+```
+
+### Проверка mountpoint
+
+По умолчанию рекомендуется требовать, чтобы `REMOTE_BACKUP_ROOT` был точкой монтирования:
+
+```bash
+REMOTE_REQUIRE_MOUNTPOINT=true
+```
+
+Это защищает от ситуации, когда NFS/Samba/rclone не смонтировались, а скрипт начал писать архивы в пустую локальную папку `/mnt/...`.
+
+Если вы используете обычную локальную папку, укажите:
+
+```bash
+REMOTE_REQUIRE_MOUNTPOINT=false
+```
+
+### Marker-файл
+
+Marker-файл защищает от записи не в то хранилище:
+
+```bash
+REMOTE_REQUIRE_MARKER=true
+REMOTE_MARKER_FILE="$REMOTE_BACKUP_ROOT/backup_marker_do_not_delete"
+```
+
+Создать marker-файл:
+
+```bash
+touch /mnt/communigate_backup/backup_marker_do_not_delete
+```
+
+Если marker-файл не нужен:
+
+```bash
+REMOTE_REQUIRE_MARKER=false
+```
+
+---
+
+## Настройки хранения
+
+```bash
+LOCAL_DAILY_RETENTION_DAYS=4
+REMOTE_DAILY_RETENTION_DAYS=14
+MONTHLY_RETENTION=3
+LOG_RETENTION_COUNT=16
+```
+
+Значения означают:
+
+- `LOCAL_DAILY_RETENTION_DAYS` — сколько дней хранить локальные дневные копии.
+- `REMOTE_DAILY_RETENTION_DAYS` — сколько дней хранить дневные копии в дополнительном хранилище.
+- `MONTHLY_RETENTION` — сколько последних месячных наборов хранить.
+- `LOG_RETENTION_COUNT` — сколько последних логов хранить.
+
+---
+
+## Настройки свободного места
+
+```bash
+REQUIRED_SPACE_LOCAL=2000
+REQUIRED_SPACE_REMOTE=5000
+```
+
+Значения указаны в мегабайтах.
+
+Если свободного места локально меньше `REQUIRED_SPACE_LOCAL`, скрипт завершится с ошибкой.
+
+Если свободного места в дополнительном хранилище меньше `REQUIRED_SPACE_REMOTE`, скрипт продолжит работу, но итоговый статус будет `CRITICAL`.
+
+---
+
+## Настройки email
+
+Скрипт отправляет письмо через локальный SMTP без авторизации:
+
+```bash
+MAIN_DOMAIN="example.com"
+EMAIL_TO="admin@example.com"
+EMAIL_FROM="backup@example.com"
+SMTP_SERVER="smtp://127.0.0.1:25"
+```
+
+В скрипте специально нет:
+
+```bash
+EMAIL_LOGIN
+EMAIL_PASS
+--user
+```
+
+Проверка локальной отправки вручную:
+
+```bash
+cat > /tmp/test-backup-mail.txt <<'MAIL'
+From: <backup@example.com>
+To: <admin@example.com>
+Subject: Test backup mail
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Тест отправки через локальный SMTP без авторизации.
+MAIL
+
+curl -v \
+  --url smtp://127.0.0.1:25 \
+  --mail-from backup@example.com \
+  --mail-rcpt admin@example.com \
+  --upload-file /tmp/test-backup-mail.txt
+```
+
+---
+
+## Использование
+
+### Обычный запуск
+
+```bash
+/usr/local/sbin/communigate-backup.sh
+```
+
+### Проверка без создания архивов и копирования
+
+```bash
+/usr/local/sbin/communigate-backup.sh --dry-run --no-email
+```
+
+### Принудительное создание месячной копии
+
+```bash
+/usr/local/sbin/communigate-backup.sh --monthly
+```
+
+### Запуск без email-уведомления
+
+```bash
+/usr/local/sbin/communigate-backup.sh --no-email
+```
+
+### Справка
+
+```bash
+/usr/local/sbin/communigate-backup.sh --help
+```
+
+---
+
+## Настройка cron
+
+Откройте системный cron:
+
+```bash
+mcedit /etc/crontab
+```
+
+Пример ежедневного запуска в 02:30:
+
+```cron
+30 2 * * * root /usr/local/sbin/communigate-backup.sh
+```
+
+---
+
+## Пример настройки NFS
+
+Установка клиента:
+
+```bash
+apt update
+apt install -y nfs-common
+```
+
+Создание точки монтирования:
+
+```bash
+mkdir -p /mnt/communigate_backup
+```
+
+Пример строки `/etc/fstab`:
+
+```fstab
+192.168.1.10:/backup/communigate /mnt/communigate_backup nfs defaults,_netdev,nofail 0 0
+```
+
+Монтирование:
+
+```bash
+mount /mnt/communigate_backup
+touch /mnt/communigate_backup/backup_marker_do_not_delete
+```
+
+Настройки в скрипте:
+
+```bash
+REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
+REMOTE_REQUIRE_MOUNTPOINT=true
+REMOTE_REQUIRE_MARKER=true
+```
+
+---
+
+## Пример настройки Samba/CIFS
+
+Установка клиента:
+
+```bash
+apt update
+apt install -y cifs-utils
+```
+
+Файл учётных данных:
+
+```bash
+mcedit /root/.smb-communigate-backup
+```
+
+Пример:
+
+```ini
+username=backup_user
+password=backup_password
+domain=WORKGROUP
+```
+
+Права:
+
+```bash
+chmod 600 /root/.smb-communigate-backup
+```
+
+Создание точки монтирования:
+
+```bash
+mkdir -p /mnt/communigate_backup
+```
+
+Пример строки `/etc/fstab`:
+
+```fstab
+//192.168.1.10/backup /mnt/communigate_backup cifs credentials=/root/.smb-communigate-backup,iocharset=utf8,vers=3.0,_netdev,nofail 0 0
+```
+
+Монтирование:
+
+```bash
+mount /mnt/communigate_backup
+touch /mnt/communigate_backup/backup_marker_do_not_delete
+```
+
+Настройки в скрипте:
+
+```bash
+REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
+REMOTE_REQUIRE_MOUNTPOINT=true
+REMOTE_REQUIRE_MARKER=true
+```
+
+---
+
+## Пример настройки rclone mount
+
+Скрипт бэкапа не запускает `rclone mount` самостоятельно. Настройте rclone mount отдельно, например через systemd.
+
+Итоговая точка должна быть доступна как обычный каталог:
+
+```text
+/mnt/communigate_backup
+```
+
+Проверка:
+
+```bash
+mountpoint /mnt/communigate_backup
+touch /mnt/communigate_backup/backup_marker_do_not_delete
+```
+
+Настройки в скрипте:
+
+```bash
+REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
+REMOTE_REQUIRE_MOUNTPOINT=true
+REMOTE_REQUIRE_MARKER=true
+```
+
+---
+
+## Структура архивов
+
+### Локально
+
+```text
+/backups/CommuniGate/
+├── Day/
+│   └── YYYY-MM-DD/
+│       ├── accounts/
+│       ├── domains/
+│       └── system/
+├── Monthly/
+│   └── YYYY-MM-DD/
+└── Logs/
+```
+
+### В дополнительном хранилище
+
+```text
+/mnt/communigate_backup/
+└── CommuniGate/
+    ├── Day/
+    │   └── YYYY-MM-DD/
+    ├── Monthly/
+    │   └── YYYY-MM-DD/
+    └── Logs/
+```
+
+---
+
+## Логи
+
+Логи хранятся локально:
+
+```text
+/backups/CommuniGate/Logs/
+```
+
+Также текущий лог копируется в дополнительное хранилище:
+
+```text
+/mnt/communigate_backup/CommuniGate/Logs/
+```
+
+Посмотреть последний лог:
+
+```bash
+ls -1t /backups/CommuniGate/Logs/backup_*.log | head -n 1
+```
+
+Пример просмотра:
+
+```bash
+tail -n 100 /backups/CommuniGate/Logs/backup_YYYY-MM-DD-HHMMSS.log
+```
+
+---
+
+## Устранение неполадок
+
+### Дополнительное хранилище недоступно
+
+Проверьте:
+
+```bash
+mountpoint /mnt/communigate_backup
+ls -la /mnt/communigate_backup
+ls -la /mnt/communigate_backup/backup_marker_do_not_delete
+```
+
+Если это обычная локальная папка, установите:
+
+```bash
+REMOTE_REQUIRE_MOUNTPOINT=false
+```
+
+### Marker-файл не найден
+
+Создайте marker-файл:
+
+```bash
+touch /mnt/communigate_backup/backup_marker_do_not_delete
+```
+
+### Email не приходит
+
+Проверьте локальную отправку:
+
+```bash
+curl -v \
+  --url smtp://127.0.0.1:25 \
+  --mail-from backup@example.com \
+  --mail-rcpt admin@example.com \
+  --upload-file /tmp/test-backup-mail.txt
+```
+
+Проверьте очередь и логи вашего почтового сервера.
+
+### Недостаточно места
+
+Проверьте:
+
+```bash
+df -h /backups/CommuniGate
+df -h /mnt/communigate_backup
+```
+
+Измените лимиты:
+
+```bash
+REQUIRED_SPACE_LOCAL=2000
+REQUIRED_SPACE_REMOTE=5000
+```
+
+### Архивы не создаются 1 числа
+
+Проверьте дату сервера:
+
+```bash
+date
+```
+
+Принудительно проверьте monthly-режим:
+
+```bash
+/usr/local/sbin/communigate-backup.sh --monthly --no-email
+```
+
+---
+
+## Безопасность перед публикацией на GitHub
+
+Перед публикацией проверьте, что в скрипте нет реальных доменов, email-адресов, паролей и внутренних IP:
+
+```bash
+grep -nE 'stpserver|clubideal|alexs|statmon|EMAIL_PASS|EMAIL_LOGIN|--user|[0-9]{1,3}(\.[0-9]{1,3}){3}' communigate-backup.sh
+```
+
+В публичной версии используйте:
+
+```bash
+MAIN_DOMAIN="example.com"
+EMAIL_TO="admin@example.com"
+EMAIL_FROM="backup@example.com"
+REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
+```
+
+Не публикуйте:
+
+```text
+rclone.conf
+*.log
+*.tar.gz
+*.conf с реальными доступами
+ключи
+пароли
+```
+
+---
+
+## Рекомендуемый `.gitignore`
+
+```gitignore
+# Реальные конфиги и секреты
+*.conf
+.env
+rclone.conf
+*.key
+*.pem
+id_rsa
+id_ed25519
+
+# Логи
+*.log
+logs/
+Logs/
+
+# Архивы и бэкапы
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.bak
+backups/
+
+# Временные файлы
+*.tmp
+*.swp
+*~
+```
+
+---
+
+## Лицензия
+
+Проект распространяется под лицензией MIT.
+
+---
+
+## Рекомендуемые права
+
+Скрипт:
+
+```bash
+chmod 700 /usr/local/sbin/communigate-backup.sh
+```
+
+Если используется отдельный конфиг с реальными настройками:
+
+```bash
+chmod 600 /etc/communigate-backup.conf
+```
