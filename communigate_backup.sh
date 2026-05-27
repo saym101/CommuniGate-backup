@@ -1,650 +1,819 @@
-#!/bin/bash
-# shellcheck disable=SC2155
-# Это отключит предупреждения о declare and assign для readonly переменных
-# shellcheck verified - все предупреждения исправлены
-# -------------------------------------------------------------------
-# CommuniGate Pro Backup Script
-# Purpose: Creates daily and monthly backups of CommuniGate Pro data,
-#          uploads them to an FTP server, cleans up old backups (local and FTP),
-#          and sends email notifications.
-# Usage: Configure the variables in "User Configuration" section below,
-#        then run the script daily via cron (e.g., `0 2 * * * /path/to/communigate_backup.sh`).
-# Requirements: bash, tar, curl, base64, pigz (optional for faster compression).
-# License: MIT (use, modify, and distribute freely with attribution).
-# -------------------------------------------------------------------
-# Автор: saym101
-# Версия: 3.4
-# Лицензия: MIT
-# Репозиторий: https://github.com/saym101/CommuniGate-backup
+#!/usr/bin/env bash
+# === Резервное копирование CommuniGate Pro (Debian 12) ===
+#
+# Логика:
+# 1) архивы создаются локально в /backups/CommuniGate/Day/YYYY-MM-DD;
+# 2) 1 числа или с ключом --monthly создаётся локальная месчная копия;
+# 3) после локального создания архивы дополнительно копируются в REMOTE_BACKUP_ROOT;
+# 4) email-отчёт отправляется через локальный SMTP 127.0.0.1:25 без авторизации.
+#
+# Важно:
+# Скрипт сам НЕ монтирует удалённое хранилище.
+# Монтирование должно быть настроено отдельно через /etc/fstab, systemd, autofs,
+# rclone service или другой удобный способ.
+#
+# Перед публикацией на GitHub замените:
+#   MAIN_DOMAIN
+#   EMAIL_TO
+#   EMAIL_FROM
+#   REMOTE_BACKUP_ROOT
+# на обезличенные значения example.com / admin@example.com / /mnt/communigate_backup.
+
 set -euo pipefail
+IFS=$'\n\t'
 
-# Скрипт зависит от этих программ. Их необходимо установить при первом запуске скрипта. потом можно закомментировать.
- apt -y install pigz curl rsync tar bc
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export DEBIAN_FRONTEND=noninteractive
 
-# Проверка на root вынесена в самое начало для большей ясности.
-if [[ "$EUID" -ne 0 ]]; then
-    echo "Скрипт не запущен от root. :( Перезапускаю через su..."
-    # Используем exec, чтобы заменить текущий процесс, а не создавать дочерний.
-    exec su -c "bash '$0' $*" root
-fi
-echo "Скрипт запущен от root. Продолжаю работу :)"
+# -------------------- НАСТРОЙКИ --------------------
 
-# -------------------- КОНФИГУРАЦИЯ ПОЛЬЗОВАТЕЛЯ --------------------
-# Эти переменные необходимо настроить под ваш сервер.
-
-PROGRAM_INSTALL=(pigz curl rsync tar bc)
-AUTO_INSTALL=false	# Запускать проверку для установки программ или нет.
-DEBUG=false  # Можно выставить в true для отладки
-FAILED_ARCHIVES_LIST=""
+PROGRAM_INSTALL=(pigz curl rsync tar bc util-linux)
+AUTO_INSTALL=false
 
 BASE_DIR="/var/CommuniGate"
-BACKUP_BASE="/backups/CommuniGate/Day"
-MONTHLY_BACKUP_DIR="/backups/CommuniGate/Monthly"
+DIR_ACCOUNTS="$BASE_DIR/Accounts"
 DOMAINS_DIR="$BASE_DIR/Domains"
 
-SHARA="/mnt/share/"
-SHARA_DIR_DAY="/CommuniGate/Day"
-SHARA_DIR_MONTHLY="/CommuniGate/Monthly"
-
-RETENTION_DAYS=6
-MONTHLY_RETENTION=3
-
-START_TS=$(date "+%Y-%m-%d-%H%M%S")
-TODAY=$(date +%Y-%m-%d)
-TODAY_DIR="$BACKUP_BASE/$TODAY"
-
-LOG_DIR="/backups/CommuniGate/Logs"
-LOG_FILE="$LOG_DIR/backup_${START_TS}.log"
-
-MAIN_DOMAIN="example.com" # Свой домен сюда
-
 FOLDER_BASE=(
-    "/var/CommuniGate/Settings"
-    "/var/CommuniGate/Directory"
-    "/var/CommuniGate/SystemLogs"
-    "/var/CommuniGate/Submitted"
+  "/var/CommuniGate/Settings"
+  "/var/CommuniGate/Directory"
+  "/var/CommuniGate/SystemLogs"
+  "/var/CommuniGate/Submitted"
 )
-#    "/var/CommuniGate/CGP-KAS" # Перенести выше в массив, если нужны. Или добавить свои.
-#    "/var/CommuniGate/CGP-KAV"
 
+LOCAL_BACKUP_ROOT="/backups/CommuniGate"
+LOCAL_DAY_BASE="$LOCAL_BACKUP_ROOT/Day"
+LOCAL_MONTHLY_BASE="$LOCAL_BACKUP_ROOT/Monthly"
+LOG_DIR="$LOCAL_BACKUP_ROOT/Logs"
+STATE_FILE="$LOG_DIR/last_run_state.txt"
+LOCKFILE="/run/communigate_backup.lock"
 
-EMAIL_TO="admin@example.com" # адрес postmaster
-EMAIL_FROM="backup@example.com" # адрес postmaster
+# -------------------- ДОПОЛНИТЕЛЬНОЕ ХРАНИЛИЩЕ --------------------
+# Здесь указывается уже доступный путь, куда дополнительно копировать архивы.
+#
+# Примеры:
+#   REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
+#   REMOTE_BACKUP_ROOT="/mnt/nfs_backup"
+#   REMOTE_BACKUP_ROOT="/mnt/samba_backup"
+#   REMOTE_BACKUP_ROOT="/mnt/rclone_backup"
+#
+# Если REMOTE_REQUIRE_MOUNTPOINT=true, путь обязан быть mountpoint.
+# Это защищает от ситуации, когда NFS/Samba/rclone не смонтировались,
+# а скрипт начал писать архивы в пустую локальную папку /mnt/....
+#
+# Если нужно использовать обычную локальную папку или примонтиованнный диск, поставьте:
+#   REMOTE_REQUIRE_MOUNTPOINT=false
+
+REMOTE_BACKUP_ENABLED=true
+REMOTE_BACKUP_ROOT="/mnt/communigate_backup"
+REMOTE_REQUIRE_MOUNTPOINT=true
+
+# Marker-файл защищает от записи не туда.
+# Создайте его один раз в целевом хранилище:
+#   touch /mnt/communigate_backup/backup_marker_do_not_delete
+#
+# Если marker не нужен:
+#   REMOTE_REQUIRE_MARKER=false
+
+REMOTE_REQUIRE_MARKER=true
+REMOTE_MARKER_FILE="$REMOTE_BACKUP_ROOT/backup_marker_do_not_delete"
+
+REMOTE_DAY_BASE="$REMOTE_BACKUP_ROOT/CommuniGate/Day"
+REMOTE_MONTHLY_BASE="$REMOTE_BACKUP_ROOT/CommuniGate/Monthly"
+REMOTE_LOG_BASE="$REMOTE_BACKUP_ROOT/CommuniGate/Logs"
+
+LOCAL_DAILY_RETENTION_DAYS=4
+REMOTE_DAILY_RETENTION_DAYS=14
+MONTHLY_RETENTION=3
+LOG_RETENTION_COUNT=16
+
+REQUIRED_SPACE_LOCAL=2000
+REQUIRED_SPACE_REMOTE=5000
+
+PIGZ_THREADS=4
+
+# -------------------- НАСТРОЙКИ ПОЧТЫ --------------------
+# Письмо отправляется через локальный SMTP без авторизации. Укажите в CjmmunuGate localhost как доверенный.
+
+MAIN_DOMAIN="example.com"
+EMAIL_TO="admin@example.com"
+EMAIL_FROM="backup@example.com"
 SMTP_SERVER="smtp://127.0.0.1:25"
-# SMTP_USER="" # для использования не локального почтового серера. в функции send_email заменить строку для отправки.
-# SMTP_PASS=""
 
-REQUIRED_SPACE=2000 # Мб минимум свободного места (пример)
-ARCHIVE_RETRY_COUNT=4      # Общее количество попыток архивации
-ARCHIVE_RETRY_DELAY_SECONDS=5 # Пауза в секундах между попытками
+# -------------------- ПЕРЕМЕННЫЕ ЗАПУСКА --------------------
 
-##################################################
-# Глобальные переменные для отчёта
-SENT_FILES=0
-SENT_FILES_LIST=""
+START_TS_LOG="$(date '+%Y-%m-%d-%H%M%S')"
+START_TS_MAIL="$(date '+%Y-%m-%d %H:%M:%S')"
+TODAY="$(date '+%Y-%m-%d')"
+DAY_OF_MONTH="$(date '+%d')"
+
+TODAY_DIR="$LOCAL_DAY_BASE/$TODAY"
+TODAY_MONTHLY_DIR="$LOCAL_MONTHLY_BASE/$TODAY"
+LOG_FILE="$LOG_DIR/backup_${START_TS_LOG}.log"
+
 TOTAL_SIZE=0
+CREATED_ARCHIVES=0
 ERRORS_IN_RUN=()
-free_space=0
-ACCOUNTS_MISSING_ARCHIVES="" # Хранит список пропущенных пользователей
-CRITICAL_ERROR=false  # Добавляем эту переменную
+CRITICAL_ERROR=false
 
-##################################################
-# Логирование
+FREE_SPACE_LOCAL=0
+FREE_SPACE_REMOTE=0
+
+CURRENT_RUN_ITEMS=""
+NEW_COUNT=0
+MISSING_COUNT=0
+NEW_ITEMS_LIST=""
+MISSING_ITEMS_LIST=""
+
+FORCE_MONTHLY=false
+DRY_RUN=false
+SEND_REPORT=true
+
+# -------------------- ЛОГИРОВАНИЕ --------------------
+
 log_message() {
-    echo "[$(date '+%F %T')] INFO: $*"
+  printf '[%s] INFO: %s\n' "$(date '+%F %T')" "$*"
 }
+
+log_warn() {
+  printf '[%s] WARN: %s\n' "$(date '+%F %T')" "$*" >&2
+}
+
 log_error() {
-    echo "[$(date '+%F %T')] ERROR: $*" >&2
-    ERRORS_IN_RUN+=("$*")
-}
-log_debug() {
-    if [[ "$DEBUG" == "true" ]]; then
-        echo "[$(date '+%F %T')] DEBUG: $*"
-    fi
-}
-# только для ошибок архивации
-log_archive_failure() {
-    echo "[$(date '+%F %T')] ERROR: $*" >&2
-    # Добавляем ошибку в ОБЩИЙ список для статуса WARNING
-    ERRORS_IN_RUN+=("$*")
-    # И отдельно добавляем путь в СПЕЦИАЛЬНЫЙ список для отчёта
-    FAILED_ARCHIVES_LIST+="<li>$2</li>"
-}
-##################################################
-# Проверка установки нужных программ
-check_dependencies() {
-    log_message "Проверка зависимостей..."
-    local missing_deps=()
-    for dep in "${PROGRAM_INSTALL[@]}"; do
-        if ! command -v "$dep" &>/dev/null; then
-            missing_deps+=("$dep")
-        fi
-    done
-
-    if (( ${#missing_deps[@]} > 0 )); then
-        log_error "Не установлены следующие зависимости: ${missing_deps[*]}"
-        if [[ "$AUTO_INSTALL" == "true" ]]; then
-            log_message "Попытка автоматической установки через apt..."
-            if apt -y install "${missing_deps[@]}" >> "$LOG_FILE" 2>&1; then
-                log_message "Все зависимости успешно установлены."
-            else
-                log_error "Ошибка при установке зависимостей. Прекращаю выполнение."
-                exit 1
-            fi
-        else
-            log_error "Автоустановка отключена. Пожалуйста, установите зависимости вручную."
-            exit 1
-        fi
-    fi
-    log_message "Все зависимости на месте."
+  printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2
+  ERRORS_IN_RUN+=("$*")
 }
 
-##################################################
-# Проверка целостности архивов
-verify_archive() {
-    local archive="$1"
-	local archive_name
-	archive_name=$(basename "$archive")
-    
-    log_message "Проверка целостности архива: $archive_name"
-    
-    if ! tar -tzf "$archive" >/dev/null 2>&1; then
-        log_error "Архив поврежден или невалиден: $archive_name"
-        return 1
-    fi
-    
-    log_debug "Архив прошел проверку целостности: $archive_name"
-    return 0
+# -------------------- СПРАВКА И АРГУМЕНТЫ --------------------
+
+usage() {
+  cat <<USAGE
+Использование:
+  $0              обычный запуск
+  $0 --monthly    принудительно создать Monthly-копию
+  $0 --dry-run    проверка без создания архивов и копирования
+  $0 --no-email   не отправлять email-отчёт
+  $0 --help       показать справку
+USAGE
 }
 
-##################################################
-# Проверка размера архивов (защита от пустых архивов)
-check_archive_size() {
-    local archive="$1"
-    local min_size=1024
-    local size
-    size=$(stat -c%s "$archive" 2>/dev/null || echo 0)
-    
-    if [[ $size -lt $min_size ]]; then
-        log_error "Архив подозрительно мал: $archive ($size bytes)"
-        return 1
-    fi
-    
-    return 0
-}
-
-##################################################
-# Валидация всех созданных архивов
-validate_all_archives() {
-    log_message "Начинаю валидацию созданных архивов..."
-    local invalid_count=0
-    local total_archives=0
-    
-    for archive in "$TODAY_DIR"/*.tar.gz; do
-        [[ -f "$archive" ]] || continue
-        ((total_archives++))
-        
-        if ! verify_archive "$archive" || ! check_archive_size "$archive"; then
-            ((invalid_count++))
-            # Помечаем проблемный архив
-            mv "$archive" "${archive}.INVALID" 2>/dev/null || true
-        fi
-    done
-    
-    if [[ $invalid_count -gt 0 ]]; then
-        log_error "Найдено $invalid_count невалидных архивов из $total_archives"
-        return 1
-    fi
-    
-    log_message "Все $total_archives архивов прошли валидацию успешно"
-    return 0
-}
-
-##################################################
-# Обработка прерываний
-cleanup() {
-    log_message "Получен сигнал прерывания. Завершаю работу..."
-    # Помечаем бэкап как неполный
-    local incomplete_dir="${TODAY_DIR}_INCOMPLETE"
-    mv "$TODAY_DIR" "$incomplete_dir" 2>/dev/null || true
-    
-    local status="INTERRUPTED"
-    local message="Резервное копирование было прервано сигналом"
-    
-    # Если была критическая ошибка до прерывания
-    if [[ "$CRITICAL_ERROR" == "true" ]]; then
-        status="CRITICAL_INTERRUPTED"
-        message="Резервное копирование было прервано после критической ошибки загрузки на шару"
-    fi
-    
-    send_email "$status" "$message"
-    exit 1
-}
-
-##################################################
-# Проверка доступности шары
-##################################################
-# Проверка и монтирование сетевой шары
-check_share_availability() {
-    log_message "Проверяю доступность сетевой шары по пути: $SHARA"
-    
-    # Если точка не смонтирована, пытаемся монтировать
-    if ! mountpoint -q "$SHARA"; then
-        log_message "Точка монтирования $SHARA не активна. Пытаюсь монтировать..."
-        
-        # Проверяем существование директории
-        if [[ ! -d "$SHARA" ]]; then
-            mkdir -p "$SHARA"
-            log_message "Создана директория для монтирования: $SHARA"
-        fi
-        
-        # Пытаемся монтировать (замените на вашу команду монтирования)
-        if mount "$SHARA" 2>/dev/null; then
-            log_message "Шара успешно смонтирована"
-        else
-            log_error "Не удалось смонтировать сетевую шару $SHARA"
-            return 1
-        fi
-    fi
-    
-    # Проверяем возможность записи
-    local test_file
-    test_file="${SHARA}/.write_test_$(date +%s)"
-    if ! touch "$test_file" 2>/dev/null; then
-        log_error "Нет прав на запись в сетевую шару $SHARA."
-        return 1
-    fi
-    rm -f "$test_file"
-    
-    log_message "Сетевая шара доступна и готова к записи."
-    return 0
-}
-
-##################################################
-# Проверка свободного места на шаре
-check_share_space() {
-    log_message "Проверка свободного места на сетевой шаре..."
-    
-    if ! check_share_availability; then
-        log_error "Невозможно проверить место на шаре - шара недоступна"
-        return 1
-    fi
-    
-    local share_space
-    share_space=$(df -m "$SHARA" | tail -1 | awk '{print $4}')
-    log_message "Свободное место на шаре: ${share_space} МБ."
-    
-    # Проверяем, достаточно ли места (например, минимум 5GB)
-    local required_share_space=5000
-    if (( share_space < required_share_space )); then
-        log_error "Недостаточно места на сетевой шаре ($share_space МБ), требуется минимум $required_share_space МБ"
-        CRITICAL_ERROR=true
-        return 1
-    fi
-    
-    return 0
-}
-
-##################################################
-# Создание архива с механизмом повтора
-create_archive() {
-    local archive_name="$1"
-    local source_path="$2"
-    local archive_path="$TODAY_DIR/${START_TS}_${archive_name}.tar.gz"
-
-    log_message "Архивация: $source_path -> $archive_path"
-
-    # Проверяем, существует ли исходная директория
-    if [[ ! -d "$source_path" ]]; then
-        log_error "Исходная директория не найдена, пропускаю: $source_path"
-        return
-    fi
-    # Проверяем, не пустая ли директория
-    if [[ -z "$(find "$source_path" -mindepth 1 -print -quit)" ]]; then
-        log_message "Директория пуста, пропускаю: $source_path"
-        return
-    fi
-
-    local attempt
-    local success=false
-    # Цикл повторных попыток
-    for attempt in $(seq 1 "$ARCHIVE_RETRY_COUNT"); do
-        # Пытаемся заархивировать
-        if tar --use-compress-program="pigz -p $(nproc)" -cf "$archive_path" -C / "${source_path:1}"; then
-            # Если успешно, выходим из цикла
-            success=true
-            break
-        fi
-
-        # Если попытка не удалась и она не последняя
-        if [[ "$attempt" -lt "$ARCHIVE_RETRY_COUNT" ]]; then
-            log_message "Попытка $attempt не удалась для $source_path. Повтор через $ARCHIVE_RETRY_DELAY_SECONDS сек..."
-            sleep "$ARCHIVE_RETRY_DELAY_SECONDS"
-        fi
-    done
-
-    # Проверяем итоговый результат
-    if [[ "$success" == "true" ]]; then
-        log_message "Архив успешно создан: $archive_path"
-        SENT_FILES=$((SENT_FILES + 1))
-        local size_bytes
-        size_bytes=$(stat -c%s "$archive_path")
-        TOTAL_SIZE=$((TOTAL_SIZE + size_bytes))
-        SENT_FILES_LIST+="<li>$(basename "$archive_path") ($((size_bytes / 1024 / 1024)) MB)</li>"
-    else
-        # Если все попытки провалились, логируем ошибку
-    log_archive_failure "Ошибка создания архива для $source_path после $ARCHIVE_RETRY_COUNT попыток." "$source_path"
-    fi
-}
-
-##################################################
-# Архивация Domains (каждая папка отдельно)
-archive_domains() {
-    log_message "Начинаю архивацию доменов из $DOMAINS_DIR"
-    for domain in "$DOMAINS_DIR"/*; do
-        [[ -d "$domain" ]] || continue
-        create_archive "Domains_$(basename "$domain")" "$domain"
-    done
-    log_message "Завершил архивацию доменов."
-}
-
-##################################################
-# Архивация Accounts
-archive_accounts() {
-    log_message "Начинаю архивацию почтовых ящиков из $BASE_DIR/Accounts"
-    local accounts_dir="$BASE_DIR/Accounts"
-    if [[ ! -d "$accounts_dir" ]]; then
-        log_error "Папка $accounts_dir не найдена! Архивация ящиков невозможна."
-        return 1
-    fi
-
-    for user_dir in "$accounts_dir"/*; do
-        [[ -d "$user_dir" ]] || continue
-        create_archive "Account_$(basename "$user_dir")" "$user_dir"
-    done
-    log_message "Завершил архивацию почтовых ящиков."
-}
-
-##################################################
-# Проверка полноты архивации аккаунтов
-check_accounts_archives() {
-    local accounts_dir="$BASE_DIR/Accounts"
-    # Сразу выходим, если директории нет.
-    [[ -d "$accounts_dir" ]] || return
-
-    mapfile -t user_dirs < <(find "$accounts_dir" -mindepth 1 -maxdepth 1 -type d)
-    mapfile -t archives < <(find "$TODAY_DIR" -maxdepth 1 -type f -name "*_Account_*.tar.gz")
-
-    log_message "Найдено пользователей в $accounts_dir: ${#user_dirs[@]}"
-    log_message "Создано архивов Account_*: ${#archives[@]}"
-
-    if (( ${#user_dirs[@]} != ${#archives[@]} )); then
-        log_error "Внимание! Количество архивов аккаунтов не совпадает с количеством папок пользователей."
-        local missing=()
-        for user_path in "${user_dirs[@]}"; do
-            local user_name
-            user_name=$(basename "$user_path")
-            # Используем glob для поиска, т.к. START_TS известен.
-            if ! ls "${TODAY_DIR}/${START_TS}_Account_${user_name}.tar.gz" >/dev/null 2>&1; then
-                missing+=("$user_name")
-            fi
-        done
-
-        if (( ${#missing[@]} > 0 )); then
-            ACCOUNTS_MISSING_ARCHIVES=$(IFS=,; echo "${missing[*]}")
-            log_error "Не созданы архивы для пользователей: $ACCOUNTS_MISSING_ARCHIVES"
-        fi
-    else
-        log_message "Все папки пользователей успешно заархивированы."
-    fi
-}
-
-##################################################
-# Архивация остальных папок из массива FOLDER_BASE
-archive_other_folders() {
-    log_message "Начинаю архивацию системных папок"
-    for folder in "${FOLDER_BASE[@]}"; do
-        create_archive "$(basename "$folder")" "$folder"
-    done
-    log_message "Завершил архивацию системных папок."
-}
-
-##################################################
-# Ежемесячное копирование
-monthly_archive() {
-    if [[ "$(date +%d)" != "01" ]]; then
-        return
-    fi
-    log_message "Первое число месяца. Выполняется ежемесячное копирование."
-    local monthly_dir="$MONTHLY_BACKUP_DIR/$TODAY"
-    mkdir -p "$monthly_dir"
-    # Копируем созданные СЕГОДНЯ архивы
-    if ! cp -aL "$TODAY_DIR"/* "$monthly_dir/"; then
-        log_error "Ошибка при копировании архивов в ежемесячную папку $monthly_dir"
-    else
-        log_message "Ежемесячный бэкап успешно скопирован в $monthly_dir"
-    fi
-}
-
-##################################################
-# Загрузка архивов на сетевую шару (универсальная): src -> dst, label для логов
-upload_to_shara() {
-    local src="${1:-$BACKUP_BASE}"
-    local dst="${2:-${SHARA}${SHARA_DIR_DAY}}"
-    local label="${3:-Дневные}"
-
-    log_message "Начинаю загрузку ${label,,} архивов на сетевую шару"
-
-    if ! check_share_availability; then
-        log_error "Сетевая шара недоступна — ${label,,} архивы остаются только локально"
-        CRITICAL_ERROR=true  # Устанавливаем флаг критической ошибки
-        return 1
-    fi
-
-    mkdir -p "$dst"
-
-    if [[ -z "$(find "$src" -name '*.tar.gz' -type f 2>/dev/null)" ]]; then
-        log_message "Архивы для загрузки не найдены в $src"
-        return 1
-    fi
-
-    if rsync -avz --delete --timeout=300 "$src/" "$dst/"; then
-        log_message "${label} архивы успешно загружены на сетевую шару."
-        return 0
-    else
-        log_error "Ошибка при загрузке ${label,,} архивов на сетевую шару."
-        CRITICAL_ERROR=true  # Устанавливаем флаг критической ошибки
-        return 1
-    fi
-}
-
-##################################################
-# Ротация архивов по количеству
-rotate_by_count() {
-    local path="$1"
-    local max_keep="$2"
-    log_message "Ротация: оставляем $max_keep последних бэкапов в $path"
-    local dirs_to_delete
-    mapfile -t dirs_to_delete < <(find "$path" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$((max_keep + 1)))
-    if (( ${#dirs_to_delete[@]} > 0 )); then
-        log_message "Найдено ${#dirs_to_delete[@]} старых директорий для удаления."
-        for old_dir in "${dirs_to_delete[@]}"; do
-            if [[ -d "$old_dir" ]]; then
-                rm -rf "$old_dir"
-                log_message "Удалена старая папка: $old_dir"
-            fi
-        done
-    else
-        log_message "Ротация не требуется."
-    fi
-}
-
-##################################################
-# Ротация логов
-rotate_logs() {
-    local max_keep=14
-    log_message "Ротация логов в $LOG_DIR (оставляем $max_keep файлов)"
-    find "$LOG_DIR" -type f -name 'backup_*.log' | sort -r | tail -n +$((max_keep + 1)) | xargs -r rm -f
-}
-
-##################################################
-# Проверка свободного места
-check_free_space() {
-    log_message "Проверка свободного места..."
-    free_space=$(df -m "$BACKUP_BASE" | tail -1 | awk '{print $4}')
-    log_message "Свободное место для бэкапов: ${free_space} МБ."
-    if (( free_space < REQUIRED_SPACE )); then
-        log_error "Недостаточно места на диске ($free_space МБ), требуется минимум $REQUIRED_SPACE МБ"
-        send_email "FATAL" "Недостаточно места на диске для создания бэкапа: $free_space МБ. Процесс прерван."
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --monthly)
+        FORCE_MONTHLY=true
+        ;;
+      --dry-run)
+        DRY_RUN=true
+        ;;
+      --no-email)
+        SEND_REPORT=false
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        usage >&2
         exit 1
-    fi
+        ;;
+    esac
+
+    shift
+  done
 }
 
-##################################################
-# Отправка почты
-send_email() {
-    local status="$1"
-    local message="$2"
-    local subject
-    subject="[CommuniGate Backup] $status: $MAIN_DOMAIN - $(date +%F)"
-    local total_size_mb
-    total_size_mb=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+# -------------------- БАЗОВЫЕ ПРОВЕРКИ --------------------
 
-    # Добавляем детальный список ошибок в письмо.
-    local error_details=""
-    if (( ${#ERRORS_IN_RUN[@]} > 0 )); then
-        error_details+="<h3>Errors and Warnings</h3>"
-        error_details+="<pre style='background-color:#f8d7da; color:#721c24; padding:10px; border:1px solid #f5c6cb; border-radius:5px;'>"
-        for error in "${ERRORS_IN_RUN[@]}"; do
-            error_details+="$error<br>"
-        done
-        error_details+="</pre>"
+check_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "Запускайте скрипт от root." >&2
+    exit 1
+  fi
+}
+
+init_log() {
+  mkdir -p "$LOG_DIR"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+
+  # Всё, что пишет скрипт, уходит и на экран, и в лог.
+  exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+acquire_lock() {
+  mkdir -p /run
+
+  # Блокировка через flock не даёт запустить второй экземпляр скрипта параллельно.
+  exec 9>"$LOCKFILE"
+
+  if ! flock -n 9; then
+    log_error "Скрипт уже запущен: $LOCKFILE"
+    exit 1
+  fi
+}
+
+cleanup() {
+  local rc=$?
+
+  if [[ "$rc" -ne 0 ]]; then
+    log_error "Скрипт завершился с ошибкой, код: $rc"
+  fi
+
+  exit "$rc"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+check_dependencies() {
+  local missing=()
+
+  # Проверяем именно команды, которые реально используются ниже.
+  for cmd in pigz curl rsync tar bc flock mountpoint df awk find sort xargs mktemp sed stat basename chmod mkdir rm mv tee; do
+    if ! require_cmd "$cmd"; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    log_message "Все зависимости найдены."
+    return 0
+  fi
+
+  log_error "Не найдены команды: ${missing[*]}"
+
+  if [[ "$AUTO_INSTALL" != "true" ]]; then
+    log_error "Автоустановка отключена. Выполните: apt update && apt install -y ${PROGRAM_INSTALL[*]}"
+    exit 1
+  fi
+
+  log_message "AUTO_INSTALL=true. Выполняю apt update."
+  apt-get update
+
+  log_message "Устанавливаю пакеты: ${PROGRAM_INSTALL[*]}"
+  apt-get install -y "${PROGRAM_INSTALL[@]}"
+}
+
+# -------------------- ПОДГОТОВКА КАТАЛОГОВ --------------------
+
+prepare_dirs() {
+  log_message "Подготовка локальных каталогов."
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_message "DRY-RUN: mkdir -p $TODAY_DIR"
+    return 0
+  fi
+
+  mkdir -p "$TODAY_DIR/accounts" "$TODAY_DIR/domains" "$TODAY_DIR/system" "$LOCAL_MONTHLY_BASE" "$LOG_DIR"
+}
+
+# -------------------- ПРОВЕРКА ДОПОЛНИТЕЛЬНОГО ХРАНИЛИЩА --------------------
+
+ensure_remote_storage() {
+  if [[ "$REMOTE_BACKUP_ENABLED" != "true" ]]; then
+    log_message "Дополнительное хранилище отключено: REMOTE_BACKUP_ENABLED=false"
+    return 0
+  fi
+
+  log_message "Проверка дополнительного хранилища: $REMOTE_BACKUP_ROOT"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_message "DRY-RUN: проверка дополнительного хранилища пропущена."
+    return 0
+  fi
+
+  if [[ -z "$REMOTE_BACKUP_ROOT" || "$REMOTE_BACKUP_ROOT" != /* ]]; then
+    log_error "REMOTE_BACKUP_ROOT должен быть абсолютным путём."
+    CRITICAL_ERROR=true
+    return 1
+  fi
+
+  if [[ "$REMOTE_REQUIRE_MOUNTPOINT" == "true" ]]; then
+    if ! mountpoint -q "$REMOTE_BACKUP_ROOT"; then
+      log_error "Дополнительное хранилище не является mountpoint: $REMOTE_BACKUP_ROOT"
+      log_error "Если это обычная локальная папка, установите REMOTE_REQUIRE_MOUNTPOINT=false"
+      CRITICAL_ERROR=true
+      return 1
+    fi
+  else
+    if [[ ! -d "$REMOTE_BACKUP_ROOT" ]]; then
+      log_warn "REMOTE_REQUIRE_MOUNTPOINT=false, создаю локальный каталог: $REMOTE_BACKUP_ROOT"
+      mkdir -p "$REMOTE_BACKUP_ROOT"
+    fi
+  fi
+
+  if [[ ! -d "$REMOTE_BACKUP_ROOT" ]]; then
+    log_error "Каталог дополнительного хранилища недоступен: $REMOTE_BACKUP_ROOT"
+    CRITICAL_ERROR=true
+    return 1
+  fi
+
+  if [[ "$REMOTE_REQUIRE_MARKER" == "true" ]]; then
+    if [[ ! -f "$REMOTE_MARKER_FILE" ]]; then
+      log_error "Marker-файл дополнительного хранилища не найден: $REMOTE_MARKER_FILE"
+      log_error "Создайте его командой: touch '$REMOTE_MARKER_FILE'"
+      CRITICAL_ERROR=true
+      return 1
+    fi
+  fi
+
+  mkdir -p "$REMOTE_DAY_BASE" "$REMOTE_MONTHLY_BASE" "$REMOTE_LOG_BASE"
+
+  log_message "Дополнительное хранилище доступно: $REMOTE_BACKUP_ROOT"
+}
+
+check_space() {
+  mkdir -p "$LOCAL_BACKUP_ROOT"
+
+  FREE_SPACE_LOCAL="$(df -Pm "$LOCAL_BACKUP_ROOT" | awk 'NR==2 {print $4}')"
+  log_message "Свободно локально: ${FREE_SPACE_LOCAL} MB"
+
+  if (( FREE_SPACE_LOCAL < REQUIRED_SPACE_LOCAL )); then
+    log_error "Мало места локально: ${FREE_SPACE_LOCAL} MB"
+    exit 1
+  fi
+
+  if [[ "$REMOTE_BACKUP_ENABLED" == "true" && "$DRY_RUN" != "true" && -d "$REMOTE_BACKUP_ROOT" ]]; then
+    FREE_SPACE_REMOTE="$(df -Pm "$REMOTE_BACKUP_ROOT" | awk 'NR==2 {print $4}')"
+    log_message "Свободно в дополнительном хранилище: ${FREE_SPACE_REMOTE} MB"
+
+    if (( FREE_SPACE_REMOTE < REQUIRED_SPACE_REMOTE )); then
+      log_error "Мало места в дополнительном хранилище: ${FREE_SPACE_REMOTE} MB"
+      CRITICAL_ERROR=true
+    fi
+  fi
+}
+
+# -------------------- АРХИВАЦИЯ --------------------
+
+safe_name() {
+  local s="$1"
+
+  # Защита имени архива от слешей и переносов строк.
+  s="${s//\//_}"
+  s="${s//$'\n'/_}"
+
+  printf '%s' "$s"
+}
+
+create_archive() {
+  local name="$1"
+  local src="$2"
+  local subdir="$3"
+
+  local dest="$TODAY_DIR/$subdir"
+  local target
+  local tmp
+  local tar_rc
+  local archive_name
+
+  if [[ ! -d "$src" ]]; then
+    log_error "Папка не найдена: $src"
+    return 1
+  fi
+
+  archive_name="$(safe_name "$name")_${START_TS_LOG}.tar.gz"
+  target="$dest/$archive_name"
+  tmp="$target.tmp"
+
+  log_message "Архивация: $src -> $target"
+
+  # В список состояния добавляем объект даже если tar вернёт предупреждение.
+  CURRENT_RUN_ITEMS+="$name"$'\n'
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_message "DRY-RUN: tar $src"
+    return 0
+  fi
+
+  mkdir -p "$dest"
+  rm -f "$tmp"
+
+  # tar может вернуть 1, если файл изменился во время чтения.
+  # Для живого почтового сервера это не всегда критично.
+  set +e
+  tar \
+    --warning=no-file-changed \
+    --ignore-failed-read \
+    --use-compress-program="pigz -p ${PIGZ_THREADS}" \
+    -cf "$tmp" \
+    -C / "${src#/}"
+  tar_rc=$?
+  set -e
+
+  if [[ -s "$tmp" && ( "$tar_rc" -eq 0 || "$tar_rc" -eq 1 ) ]]; then
+    if [[ "$tar_rc" -eq 1 ]]; then
+      log_warn "tar вернул код 1 для $src: архив создан, но были предупреждения."
     fi
 
-    local html_body
-    html_body=$(cat <<EOF
+    mv -f "$tmp" "$target"
+    chmod 600 "$target"
+
+    TOTAL_SIZE=$(( TOTAL_SIZE + $(stat -c '%s' "$target") ))
+    CREATED_ARCHIVES=$(( CREATED_ARCHIVES + 1 ))
+
+    return 0
+  fi
+
+  rm -f "$tmp"
+  log_error "Ошибка создания архива: $src, код tar: $tar_rc"
+  return 1
+}
+
+backup_all() {
+  local u
+  local d_path
+  local d_name
+  local f
+
+  # nullglob нужен, чтобы шаблон *.macnt не оставался строкой,
+  # если таких каталогов нет.
+  shopt -s nullglob
+
+  log_message "Архивация основных аккаунтов."
+
+  for u in "$DIR_ACCOUNTS"/*.macnt; do
+    if [[ -d "$u" ]]; then
+      if ! create_archive "$(basename "$u" .macnt)" "$u" "accounts"; then
+        log_warn "Архивация аккаунта завершилась с ошибкой: $u"
+      fi
+    fi
+  done
+
+  log_message "Архивация доменных аккаунтов."
+
+  if [[ -d "$DOMAINS_DIR" ]]; then
+    for d_path in "$DOMAINS_DIR"/*; do
+      if [[ ! -d "$d_path" ]]; then
+        continue
+      fi
+
+      d_name="$(basename "$d_path")"
+
+      for u in "$d_path"/*.macnt; do
+        if [[ -d "$u" ]]; then
+          if ! create_archive "$(basename "$u" .macnt)@$d_name" "$u" "domains/$d_name"; then
+            log_warn "Архивация доменного аккаунта завершилась с ошибкой: $u"
+          fi
+        fi
+      done
+    done
+  else
+    log_warn "Каталог доменов не найден: $DOMAINS_DIR"
+  fi
+
+  log_message "Архивация системных папок."
+
+  for f in "${FOLDER_BASE[@]}"; do
+    if [[ -d "$f" ]]; then
+      if ! create_archive "$(basename "$f")" "$f" "system"; then
+        log_warn "Архивация системной папки завершилась с ошибкой: $f"
+      fi
+    else
+      log_warn "Папка пропущена: $f"
+    fi
+  done
+
+  shopt -u nullglob
+}
+
+# -------------------- АНАЛИЗ ИЗМЕНЕНИЙ --------------------
+
+analyze_changes() {
+  log_message "Анализ изменений состава архивируемых объектов."
+
+  if [[ -f "$STATE_FILE" ]]; then
+    NEW_ITEMS_LIST="$(comm -13 <(sort "$STATE_FILE") <(printf '%s' "$CURRENT_RUN_ITEMS" | sort) | grep -v '^$' || true)"
+    MISSING_ITEMS_LIST="$(comm -23 <(sort "$STATE_FILE") <(printf '%s' "$CURRENT_RUN_ITEMS" | sort) | grep -v '^$' || true)"
+
+    NEW_COUNT="$(printf '%s' "$NEW_ITEMS_LIST" | grep -c '.' || true)"
+    MISSING_COUNT="$(printf '%s' "$MISSING_ITEMS_LIST" | grep -c '.' || true)"
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+
+  printf '%s' "$CURRENT_RUN_ITEMS" | sort > "$STATE_FILE"
+}
+
+# -------------------- MONTHLY --------------------
+
+create_monthly() {
+  log_message "Создание локальной Monthly-копии: $TODAY_MONTHLY_DIR"
+
+  if [[ ! -d "$TODAY_DIR" ]]; then
+    log_error "Нет дневного бэкапа: $TODAY_DIR"
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_message "DRY-RUN: Monthly из $TODAY_DIR"
+    return 0
+  fi
+
+  mkdir -p "$TODAY_MONTHLY_DIR"
+
+  rsync \
+    -rtv \
+    --delete \
+    --no-owner \
+    --no-group \
+    --no-perms \
+    --omit-dir-times \
+    "$TODAY_DIR/" "$TODAY_MONTHLY_DIR/"
+}
+
+# -------------------- ПЕРЕНОС В ДОПОЛНИТЕЛЬНОЕ ХРАНИЛИЩЕ --------------------
+
+sync_to_remote() {
+  local src="$1"
+  local dst="$2"
+  local label="$3"
+
+  if [[ "$REMOTE_BACKUP_ENABLED" != "true" ]]; then
+    log_message "Дополнительное хранилище отключено, пропуск: $label"
+    return 0
+  fi
+
+  if [[ ! -d "$src" && "$DRY_RUN" != "true" ]]; then
+    log_error "Нет источника для $label: $src"
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_message "DRY-RUN: rsync $src/ -> $dst/"
+    return 0
+  fi
+
+  if [[ ! -d "$REMOTE_BACKUP_ROOT" ]]; then
+    log_error "Дополнительное хранилище недоступно, перенос невозможен: $label"
+    CRITICAL_ERROR=true
+    return 1
+  fi
+
+  if [[ "$REMOTE_REQUIRE_MOUNTPOINT" == "true" ]] && ! mountpoint -q "$REMOTE_BACKUP_ROOT"; then
+    log_error "Дополнительное хранилище больше не является mountpoint: $REMOTE_BACKUP_ROOT"
+    CRITICAL_ERROR=true
+    return 1
+  fi
+
+  mkdir -p "$dst"
+
+  log_message "Перенос в дополнительное хранилище: $label"
+
+  # Не используем rsync -a:
+  # remote storage может быть FTP/rclone, CIFS, NFS или другой FUSE,
+  # где chown/chmod/hardlinks могут не поддерживаться.
+  rsync \
+    -rtv \
+    --delete \
+    --no-owner \
+    --no-group \
+    --no-perms \
+    --omit-dir-times \
+    --timeout=300 \
+    "$src/" "$dst/" || {
+      log_error "Ошибка переноса в дополнительное хранилище: $label"
+      CRITICAL_ERROR=true
+      return 1
+    }
+}
+
+# -------------------- РОТАЦИЯ --------------------
+
+rotate_backups() {
+  log_message "Ротация локальных и remote-копий."
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_message "DRY-RUN: ротация пропущена."
+    return 0
+  fi
+
+  find "$LOCAL_DAY_BASE" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    -mtime +"$LOCAL_DAILY_RETENTION_DAYS" \
+    -exec rm -rf {} +
+
+  find "$LOCAL_MONTHLY_BASE" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    | sort -r \
+    | tail -n +$((MONTHLY_RETENTION + 1)) \
+    | xargs -r rm -rf
+
+  find "$LOG_DIR" \
+    -name 'backup_*.log' \
+    -type f \
+    | sort -r \
+    | tail -n +$((LOG_RETENTION_COUNT + 1)) \
+    | xargs -r rm -f
+
+  if [[ "$REMOTE_BACKUP_ENABLED" == "true" && -d "$REMOTE_BACKUP_ROOT" ]]; then
+    if [[ "$REMOTE_REQUIRE_MOUNTPOINT" != "true" || $(mountpoint -q "$REMOTE_BACKUP_ROOT"; echo $?) -eq 0 ]]; then
+      find "$REMOTE_DAY_BASE" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        -mtime +"$REMOTE_DAILY_RETENTION_DAYS" \
+        -exec rm -rf {} + 2>/dev/null || true
+
+      find "$REMOTE_MONTHLY_BASE" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d 2>/dev/null \
+        | sort -r \
+        | tail -n +$((MONTHLY_RETENTION + 1)) \
+        | xargs -r rm -rf
+
+      find "$REMOTE_LOG_BASE" \
+        -name 'backup_*.log' \
+        -type f 2>/dev/null \
+        | sort -r \
+        | tail -n +$((LOG_RETENTION_COUNT + 1)) \
+        | xargs -r rm -f
+    fi
+  fi
+}
+
+# -------------------- EMAIL БЕЗ АВТОРИЗАЦИИ --------------------
+
+send_email_report() {
+  local status="$1"
+  local msg="$2"
+
+  local end_ts
+  local size_gb
+  local extra=""
+  local errors=""
+  local mail_tmp
+  local curl_rc=0
+
+  if [[ "$SEND_REPORT" != "true" ]]; then
+    log_message "Отправка email отключена параметром --no-email."
+    return 0
+  fi
+
+  if ! require_cmd curl || ! require_cmd bc || ! require_cmd mktemp; then
+    log_error "curl, bc или mktemp не найдены, email не отправлен."
+    return 1
+  fi
+
+  end_ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  size_gb="$(bc <<< "scale=2; $TOTAL_SIZE / 1073741824")"
+
+  if [[ "$NEW_COUNT" -gt 0 ]]; then
+    extra+="<p style='color:green;'><b>Добавлены:</b><br>${NEW_ITEMS_LIST//$'\n'/<br>}</p>"
+  fi
+
+  if [[ "$MISSING_COUNT" -gt 0 ]]; then
+    extra+="<p style='color:red;'><b>Пропущены/удалены:</b><br>${MISSING_ITEMS_LIST//$'\n'/<br>}</p>"
+  fi
+
+  if [[ ${#ERRORS_IN_RUN[@]} -gt 0 ]]; then
+    errors="<p style='color:red;'><b>Ошибки:</b><br>$(printf '%s\n' "${ERRORS_IN_RUN[@]}" | sed 's/$/<br>/')</p>"
+  fi
+
+  mail_tmp="$(mktemp /tmp/communigate-backup-mail.XXXXXX)"
+
+  {
+    echo "From: <${EMAIL_FROM}>"
+    echo "To: <${EMAIL_TO}>"
+    echo "Subject: [Backup] ${status}: ${MAIN_DOMAIN} - ${TODAY}"
+    echo "MIME-Version: 1.0"
+    echo "Content-Type: text/html; charset=UTF-8"
+    echo ""
+    cat <<HTML
 <html>
-<body style="font-family: Arial, sans-serif;">
-<h2>Отчёт о резервном копировании CommuniGate</h2>
-<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>
-  <tr style="background-color: #f2f2f2;"><th>Параметр</th><th>Значение</th></tr>
-  <tr><td><b>Статус</b></td><td><b>${status}</b></td></tr>
-  <tr><td>Сообщение</td><td>${message}</td></tr>
-  <tr><td>Время начала</td><td>${START_TS}</td></tr>
-  <tr><td>Время окончания</td><td>$(date '+%Y-%m-%d %H:%M:%S')</td></tr>
-  <tr><td>Создано архивов</td><td>${SENT_FILES}</td></tr>
-  <tr><td>Общий размер</td><td>${total_size_mb} MB</td></tr>
-  <tr><td>Свободно на диске</td><td>${free_space} МБ</td></tr>
-  ${ACCOUNTS_MISSING_ARCHIVES:+"<tr><td>Пропущенные аккаунты</td><td style='color:red;'>${ACCOUNTS_MISSING_ARCHIVES}</td></tr>"}
+<body style="font-family:Arial;">
+<h2>Отчёт резервного копирования CommuniGate</h2>
+
+<table border="0" cellpadding="5" style="border-collapse:collapse;">
+<tr><td><b>Статус:</b></td><td>${status}</td></tr>
+<tr><td><b>Сообщение:</b></td><td>${msg}</td></tr>
+<tr><td><b>Начало:</b></td><td>${START_TS_MAIL}</td></tr>
+<tr><td><b>Конец:</b></td><td>${end_ts}</td></tr>
+<tr><td><b>Создано архивов:</b></td><td>${CREATED_ARCHIVES}</td></tr>
+<tr><td><b>Размер:</b></td><td>${size_gb} GB</td></tr>
+<tr><td><b>Локально Day:</b></td><td>${TODAY_DIR}</td></tr>
+<tr><td><b>Локально Monthly:</b></td><td>${TODAY_MONTHLY_DIR}</td></tr>
+<tr><td><b>Remote Day:</b></td><td>${REMOTE_DAY_BASE}/${TODAY}</td></tr>
+<tr><td><b>Remote Monthly:</b></td><td>${REMOTE_MONTHLY_BASE}/${TODAY}</td></tr>
+<tr><td><b>Свободно локально:</b></td><td>${FREE_SPACE_LOCAL} MB</td></tr>
+<tr><td><b>Свободно remote:</b></td><td>${FREE_SPACE_REMOTE} MB</td></tr>
+<tr><td><b>Лог:</b></td><td>${LOG_FILE}</td></tr>
 </table>
-<h3>Список созданных архивов</h3>
-<ul>${SENT_FILES_LIST:-"<li>Архивы не созданы</li>"}</ul>
-${error_details}
-${FAILED_ARCHIVES_LIST:+<h3>Не удалось заархивировать</h3><ul>${FAILED_ARCHIVES_LIST}</ul>}
-<p>Полный лог-файл доступен на сервере: ${LOG_FILE}</p>
+
+${extra}
+${errors}
+
 </body>
 </html>
-EOF
-)
-    # Отправляем письмо через curl
-    (
-        echo "From: CommuniGate Backup <$EMAIL_FROM>"
-        echo "To: <$EMAIL_TO>"
-        echo "Subject: $subject"
-        echo "MIME-Version: 1.0"
-        echo "Content-Type: text/html; charset=UTF-8"
-        echo
-        echo "$html_body"
-    ) | if ! curl -s --url "$SMTP_SERVER" --mail-from "$EMAIL_FROM" --mail-rcpt "$EMAIL_TO" --upload-file - >> "$LOG_FILE" 2>&1; then
-        log_error "Не удалось отправить email уведомление."
-    else
-        log_message "Email уведомление успешно отправлено."
-    fi
-# для использования с аутентификацией. нужное заменить:
-# curl -s --url "$SMTP_SERVER" --mail-from "$EMAIL_FROM" --mail-rcpt "$EMAIL_TO" --user "$SMTP_USER:$SMTP_PASS" --upload-file - >> "$LOG_FILE" 2>&1
-# для использования без аутентификацией. нужное заменить:
-# curl -s --url "$SMTP_SERVER" --mail-from "$EMAIL_FROM" --mail-rcpt "$EMAIL_TO" --upload-file - >> "$LOG_FILE" 2>&1; then   
+HTML
+  } > "$mail_tmp"
+
+  chmod 600 "$mail_tmp"
+
+  log_message "Отправка email-отчёта через локальный SMTP без авторизации: ${SMTP_SERVER}"
+
+  curl \
+    --fail \
+    --silent \
+    --show-error \
+    --url "$SMTP_SERVER" \
+    --mail-from "$EMAIL_FROM" \
+    --mail-rcpt "$EMAIL_TO" \
+    --upload-file "$mail_tmp" || curl_rc=$?
+
+  rm -f "$mail_tmp"
+
+  if [[ "$curl_rc" -ne 0 ]]; then
+    log_error "Email-отчёт не отправлен. curl завершился с кодом: $curl_rc"
+    return "$curl_rc"
+  fi
+
+  log_message "Email-отчёт успешно отправлен."
+  return 0
 }
 
+# -------------------- MAIN --------------------
 
-
-
-##################################################
-# Главная функция
 main() {
-    # Создаем директории и настраиваем логирование
-    mkdir -p "$TODAY_DIR" "$LOG_DIR"
-    
-    # Регистрируем обработчики сигналов ПЕРВЫМ ДЕЛОМ
-    trap cleanup SIGTERM SIGINT SIGHUP
-    
-    # Перенаправляем весь вывод в лог и на консоль
-    exec &> >(tee -a "$LOG_FILE")
-    
-    log_message "=== НАЧАЛО РЕЗЕРВНОГО КОПИРОВАНИЯ ==="
+  parse_args "$@"
+  check_root
+  init_log
 
-    check_dependencies
-    check_free_space
+  trap cleanup EXIT INT TERM SIGHUP
 
-    # --- Создание архивов ---
-    archive_accounts
-    archive_domains
-    archive_other_folders
-    check_accounts_archives
-    # --- Проверка архивов ---
-    validate_all_archives
+  acquire_lock
 
-    # Более надёжная проверка, были ли созданы архивы.
-    if ! find "$TODAY_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit | grep -q .; then
-        log_error "Ни одного архива не было создано. Процесс прерван."
-        send_email "FATAL" "Резервное копирование провалилось: ни одного архива не создано."
-        exit 1
+  log_message "=== СТАРТ БЭКАПА ==="
+  log_message "TODAY=$TODAY DAY_OF_MONTH=$DAY_OF_MONTH FORCE_MONTHLY=$FORCE_MONTHLY DRY_RUN=$DRY_RUN"
+  log_message "REMOTE_BACKUP_ENABLED=$REMOTE_BACKUP_ENABLED REMOTE_BACKUP_ROOT=$REMOTE_BACKUP_ROOT"
+
+  check_dependencies
+  prepare_dirs
+  ensure_remote_storage || true
+  check_space
+
+  backup_all
+  analyze_changes
+
+  # Monthly создаётся ДО переноса в дополнительное хранилище.
+  if [[ "$DAY_OF_MONTH" == "01" || "$FORCE_MONTHLY" == "true" ]]; then
+    create_monthly || CRITICAL_ERROR=true
+  else
+    log_message "Monthly сегодня не создаётся. Для проверки: $0 --monthly"
+  fi
+
+  # Перенос Day в дополнительное хранилище.
+  sync_to_remote "$TODAY_DIR" "$REMOTE_DAY_BASE/$TODAY" "Day $TODAY" || true
+
+  # Перенос Monthly в дополнительное хранилище, если он создан.
+  if [[ -d "$TODAY_MONTHLY_DIR" || "$FORCE_MONTHLY" == "true" || "$DAY_OF_MONTH" == "01" ]]; then
+    sync_to_remote "$TODAY_MONTHLY_DIR" "$REMOTE_MONTHLY_BASE/$TODAY" "Monthly $TODAY" || true
+  fi
+
+  # Копируем текущий лог в дополнительное хранилище.
+  if [[ "$REMOTE_BACKUP_ENABLED" == "true" && "$DRY_RUN" != "true" && -d "$REMOTE_LOG_BASE" ]]; then
+    rsync \
+      -rtv \
+      --no-owner \
+      --no-group \
+      --no-perms \
+      --omit-dir-times \
+      "$LOG_FILE" "$REMOTE_LOG_BASE/" || true
+  fi
+
+  rotate_backups
+
+  local status="SUCCESS"
+  local msg="Бэкап успешно завершён"
+
+  if [[ "$CRITICAL_ERROR" == "true" ]]; then
+    status="CRITICAL"
+    msg="Бэкап завершён с критическими ошибками. Проверьте лог: $LOG_FILE"
+  elif [[ ${#ERRORS_IN_RUN[@]} -gt 0 ]]; then
+    status="WARNING"
+    msg="Бэкап завершён с предупреждениями. Проверьте лог: $LOG_FILE"
+  fi
+
+  if ! send_email_report "$status" "$msg"; then
+    log_error "Основной бэкап завершён, но email-уведомление не отправлено."
+
+    if [[ "$status" == "SUCCESS" ]]; then
+      status="WARNING"
+      msg="Бэкап завершён успешно, но email-уведомление не отправлено"
     fi
-    log_message "Архивы успешно созданы. Всего: $SENT_FILES шт."
+  fi
 
-    # --- Ротация и загрузка ---
-    rotate_by_count "$BACKUP_BASE" "$RETENTION_DAYS"
-    
-    # Проверяем место на шаре перед загрузкой
-    if check_share_space; then
-        upload_to_shara "$BACKUP_BASE" "${SHARA}${SHARA_DIR_DAY}" "Дневные"
-    else
-        log_error "Пропускаю загрузку на шару из-за нехватки места"
-    fi
-
-    # --- Ежемесячные задачи ---
-    if [[ "$(date +%d)" == "01" ]]; then
-        monthly_archive
-        rotate_by_count "$MONTHLY_BACKUP_DIR" "$MONTHLY_RETENTION"
-        if check_share_space; then
-            upload_to_shara "$MONTHLY_BACKUP_DIR" "${SHARA}${SHARA_DIR_MONTHLY}" "Месячные"
-        else
-            log_error "Пропускаю загрузку месячных архивов на шару из-за нехватки места"
-        fi
-    fi
-
-    # --- Формирование отчёта ---
-    local final_status="SUCCESS"
-    local final_message="Резервное копирование выполнено успешно."
-    
-    if [[ "$CRITICAL_ERROR" == "true" ]]; then
-        final_status="CRITICAL"
-        final_message="Резервное копирование завершено с КРИТИЧЕСКИМИ ошибками (проблемы с загрузкой на шару)."
-    elif (( ${#ERRORS_IN_RUN[@]} > 0 )); then
-        final_status="WARNING"
-        final_message="Резервное копирование выполнено с ошибками или предупреждениями."
-    fi
-    
-    send_email "$final_status" "$final_message"
-
-    rotate_logs
-    log_message "=== ЗАВЕРШЕНИЕ РЕЗЕРВНОГО КОПИРОВАНИЯ ==="
-    
-    # Если была критическая ошибка, завершаем с ненулевым кодом
-    if [[ "$CRITICAL_ERROR" == "true" ]]; then
-        exit 1
-    fi
+  log_message "=== КОНЕЦ: $status ==="
 }
-##################################################
-# Запуск
+
 main "$@"
